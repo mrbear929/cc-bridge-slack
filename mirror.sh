@@ -365,17 +365,40 @@ PY
       continue
     fi
 
-    # Step 3: complete + share to channel
-    local complete_body complete_resp ok
-    complete_body="$(jq -nc \
-      --arg ch "$channel" --arg fid "$file_id" --arg title "$fname" \
-      '{channel_id:$ch, files:[{id:$fid, title:$title}]}')"
+    # Step 3: complete WITHOUT sharing to channel (no channel_id), so Slack
+    # finalizes the file but doesn't post the system "bot uploaded a file"
+    # message. We'll share it ourselves as Bear in step 4.
+    local complete_body complete_resp ok permalink
+    complete_body="$(jq -nc --arg fid "$file_id" --arg title "$fname" \
+      '{files:[{id:$fid, title:$title}]}')"
     complete_resp="$(slack_api files.completeUploadExternal "$complete_body")"
     ok="$(jq -r '.ok' <<<"$complete_resp" 2>/dev/null)"
-    if [[ "$ok" = "true" ]]; then
-      log "image uploaded $fname ($size bytes) to $channel"
-    else
+    if [[ "$ok" != "true" ]]; then
       log "image upload step3 failed: $complete_resp"
+      continue
+    fi
+    permalink="$(jq -r '.files[0].permalink // empty' <<<"$complete_resp" 2>/dev/null)"
+    if [[ -z "$permalink" ]]; then
+      log "image upload step3 ok but no permalink: $complete_resp"
+      continue
+    fi
+
+    # Step 4: post as Bear with the permalink — Slack unfurls it inline.
+    # Setting unfurl_links/unfurl_media true ensures the image renders.
+    local post_body post_resp post_ok
+    post_body="$(jq -nc \
+      --arg ch "$channel" \
+      --arg t "$permalink" \
+      --arg u "$BEAR_DISPLAY_NAME" \
+      --arg i "$BEAR_ICON_URL" \
+      '{channel:$ch, text:$t, mrkdwn:false, username:$u, unfurl_links:true, unfurl_media:true}
+       + (if $i != "" then {icon_url:$i} else {} end)')"
+    post_resp="$(slack_api chat.postMessage "$post_body")"
+    post_ok="$(jq -r '.ok' <<<"$post_resp" 2>/dev/null)"
+    if [[ "$post_ok" = "true" ]]; then
+      log "image uploaded+posted $fname ($size bytes) as Bear in $channel"
+    else
+      log "image upload step4 (post as Bear) failed: $post_resp"
     fi
   done
 
