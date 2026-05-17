@@ -1,0 +1,35 @@
+{
+  "_comment": "Hook config template. install.sh merges this into ~/.claude/settings.json. To enable manually, paste the 'hooks' block into ~/.claude/settings.json.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/xzixuan/Documents/obsidian-vault/dev/tools/cc-bridge-slack/mirror.sh user"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/xzixuan/Documents/obsidian-vault/dev/tools/cc-bridge-slack/mirror.sh assistant"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/xzixuan/Documents/obsidian-vault/dev/tools/cc-bridge-slack/mirror.sh end"
+          }
+        ]
+      }
+    ]
+  }
+}
