@@ -384,14 +384,17 @@ PY
     fi
 
     # Step 4: post as Bear with the permalink — Slack unfurls it inline.
-    # Setting unfurl_links/unfurl_media true ensures the image renders.
+    # Use <url| > with empty visible text so the link itself is hidden
+    # but Slack still unfurls it as the image preview underneath.
     local post_body post_resp post_ok
+    local hidden_link
+    hidden_link="<${permalink}| >"
     post_body="$(jq -nc \
       --arg ch "$channel" \
-      --arg t "$permalink" \
+      --arg t "$hidden_link" \
       --arg u "$BEAR_DISPLAY_NAME" \
       --arg i "$BEAR_ICON_URL" \
-      '{channel:$ch, text:$t, mrkdwn:false, username:$u, unfurl_links:true, unfurl_media:true}
+      '{channel:$ch, text:$t, mrkdwn:true, username:$u, unfurl_links:true, unfurl_media:true}
        + (if $i != "" then {icon_url:$i} else {} end)')"
     post_resp="$(slack_api chat.postMessage "$post_body")"
     post_ok="$(jq -r '.ok' <<<"$post_resp" 2>/dev/null)"
