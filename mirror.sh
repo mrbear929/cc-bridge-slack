@@ -210,6 +210,31 @@ ensure_channel() {
   printf '%s' "$ch_id"
 }
 
+# Convert GitHub-flavored markdown to Slack's mrkdwn syntax.
+# Code blocks (triple-backtick and inline backtick) are protected verbatim
+# so things like `**foo**` stay literal inside code.
+# Calls Python via -c with the input on stdin via process-sub redirection
+# so it composes cleanly inside other pipelines.
+gfm_to_mrkdwn() {
+  python3 -c '
+import re, sys
+text = sys.stdin.read()
+blocks = []
+def stash(m):
+    blocks.append(m.group(0))
+    return f"\x00{len(blocks)-1}\x00"
+text = re.sub(r"```[\s\S]*?```", stash, text)
+text = re.sub(r"`[^`\n]+`", stash, text)
+text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r"<\2|\1>", text)
+text = re.sub(r"(?m)^#{1,6}\s+(.+?)\s*$", r"*\1*", text)
+text = re.sub(r"\*\*([^*\n]+?)\*\*", r"*\1*", text)
+text = re.sub(r"~~([^~\n]+?)~~", r"~\1~", text)
+def restore(m): return blocks[int(m.group(1))]
+text = re.sub(r"\x00(\d+)\x00", restore, text)
+sys.stdout.write(text)
+'
+}
+
 post_to_channel() {
   local channel="$1" text="$2" username="$3" icon_url="$4"
   local body
@@ -270,6 +295,12 @@ fi
 if [[ -z "$CONTENT" && "$ROLE" != "end" ]]; then
   log "skip role=$ROLE (empty content) sid=$SID8"
   exit 0
+fi
+
+# Convert assistant content from GitHub-flavored markdown to Slack mrkdwn.
+# User prompts pass through unchanged (people don't typically type ** in chat).
+if [[ "$ROLE" = "assistant" ]]; then
+  CONTENT="$(printf '%s' "$CONTENT" | gfm_to_mrkdwn)"
 fi
 
 # Truncate to Slack-friendly size
