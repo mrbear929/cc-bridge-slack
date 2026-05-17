@@ -235,6 +235,112 @@ sys.stdout.write(text)
 '
 }
 
+# Upload images from the most recent user message in the transcript to a
+# Slack channel. Synchronous — adds 1-2s per image to the user post path.
+# Hooks payload doesn't include image data (only the .prompt string), so we
+# parse them out of the JSONL transcript. Uses Slack files.upload_v2 flow.
+#
+# Args: $1 = transcript_path, $2 = channel_id
+# Cap: 5 MB per image. Skips silently on missing transcript / decode errors.
+upload_user_images() {
+  local transcript="$1" channel="$2"
+  [[ -z "$transcript" || ! -f "$transcript" ]] && return 0
+
+  # Extract base64 images from the LAST user message that has any. Latest-only
+  # avoids re-uploading on every prompt.
+  local extract_dir
+  extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/cc-bridge-imgs.XXXXXX")" || return 0
+
+  python3 - "$transcript" "$extract_dir" >/dev/null <<'PY' 2>/dev/null
+import json, sys, base64, os
+transcript_path, out_dir = sys.argv[1], sys.argv[2]
+
+last_user_with_images = None
+with open(transcript_path) as f:
+    for line in f:
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "user":
+            continue
+        msg = d.get("message", {})
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        if any(c.get("type") == "image" for c in content if isinstance(c, dict)):
+            last_user_with_images = content
+
+if not last_user_with_images:
+    sys.exit(0)
+
+idx = 0
+for c in last_user_with_images:
+    if not isinstance(c, dict) or c.get("type") != "image":
+        continue
+    src = c.get("source", {})
+    if src.get("type") != "base64":
+        continue
+    media = src.get("media_type", "image/png")
+    ext = media.split("/")[-1] or "png"
+    data_b64 = src.get("data", "")
+    try:
+        raw = base64.b64decode(data_b64)
+    except Exception:
+        continue
+    if len(raw) > 5 * 1024 * 1024:
+        continue
+    idx += 1
+    path = os.path.join(out_dir, f"image-{idx}.{ext}")
+    with open(path, "wb") as out:
+        out.write(raw)
+    print(path)
+PY
+
+  for img_path in "$extract_dir"/*; do
+    [[ ! -f "$img_path" ]] && continue
+
+    local fname size
+    fname="$(basename "$img_path")"
+    size=$(stat -f%z "$img_path" 2>/dev/null || stat -c%s "$img_path")
+
+    # Step 1: get upload URL
+    local upload_resp upload_url file_id
+    upload_resp="$(curl -sS -G "https://slack.com/api/files.getUploadURLExternal" \
+      -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+      --data-urlencode "filename=$fname" \
+      --data-urlencode "length=$size" 2>>"$LOG_FILE")"
+    upload_url="$(jq -r '.upload_url // empty' <<<"$upload_resp" 2>/dev/null)"
+    file_id="$(jq -r '.file_id // empty' <<<"$upload_resp" 2>/dev/null)"
+    if [[ -z "$upload_url" || -z "$file_id" ]]; then
+      log "image upload step1 failed: $upload_resp"
+      continue
+    fi
+
+    # Step 2: POST file bytes
+    if ! curl -sS --data-binary "@$img_path" "$upload_url" >/dev/null 2>>"$LOG_FILE"; then
+      log "image upload step2 failed for $fname"
+      continue
+    fi
+
+    # Step 3: complete + share to channel
+    local complete_body complete_resp ok
+    complete_body="$(jq -nc \
+      --arg ch "$channel" --arg fid "$file_id" --arg title "$fname" \
+      '{channel_id:$ch, files:[{id:$fid, title:$title}]}')"
+    complete_resp="$(slack_api files.completeUploadExternal "$complete_body")"
+    ok="$(jq -r '.ok' <<<"$complete_resp" 2>/dev/null)"
+    if [[ "$ok" = "true" ]]; then
+      log "image uploaded $fname ($size bytes) to $channel"
+    else
+      log "image upload step3 failed: $complete_resp"
+    fi
+  done
+
+  rm -rf "$extract_dir"
+  return 0
+}
+
 post_to_channel() {
   local channel="$1" text="$2" username="$3" icon_url="$4"
   local body
@@ -336,6 +442,17 @@ case "$ROLE" in
     [[ -z "$CHANNEL_ID" ]] && exit 0
     post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
       && log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
+
+    # Synchronous image upload from transcript (5MB cap, latest user msg only).
+    # Hook fires concurrently with transcript write; retry briefly if needed.
+    if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
+      # Wait up to 2s for the user message with image content to land in transcript
+      for _ in 1 2 3 4; do
+        if grep -q '"type":"image"' "$TRANSCRIPT_PATH" 2>/dev/null; then break; fi
+        sleep 0.5
+      done
+      upload_user_images "$TRANSCRIPT_PATH" "$CHANNEL_ID"
+    fi
 
     # Save first prompt for later title generation
     if [[ -f "$STATE_FILE" ]]; then
