@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  cc-bridge daemon launchd plist.
+
+  Install:
+    cp launchd/com.bear.cc-bridge.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bear.cc-bridge.plist
+    launchctl enable gui/$(id -u)/com.bear.cc-bridge
+
+  Start now:    launchctl kickstart -k gui/$(id -u)/com.bear.cc-bridge
+  Stop:         launchctl bootout gui/$(id -u)/com.bear.cc-bridge
+  Status:       launchctl print gui/$(id -u)/com.bear.cc-bridge | head -30
+
+  IMPORTANT: SLACK_APP_TOKEN must be set somewhere readable to launchd.
+  Easiest: hardcode below from Apple Passwords. Or use a wrapper that
+  reads the keychain. For now this plist references a wrapper script
+  that pulls the token from ~/.claude/tools/slack-bridge-app.token
+  (mode 0600). install.sh creates that file.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bear.cc-bridge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/xzixuan/Documents/obsidian-vault/dev/tools/cc-bridge-slack/daemon/run.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cc-bridge-daemon.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/tmp/cc-bridge-daemon.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/xzixuan/Documents/obsidian-vault/dev/tools/cc-bridge-slack/daemon</string>
+</dict>
+</plist>

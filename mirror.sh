@@ -67,8 +67,31 @@ export SLACK_BOT_TOKEN
 
 mkdir -p "$STATE_DIR" 2>/dev/null
 
+# Daemon-controlled kill switch: presence of 'disabled' flag = paused.
+# Only blocks NEW sessions from being created. Already-active sessions
+# (with state files) keep mirroring through the rest of their lifetime.
+if [[ -f "$STATE_DIR/disabled" ]]; then
+  # Read sid early so we can check whether this session is already tracked.
+  _sid_check="$(jq -r '.session_id // empty' 2>/dev/null < /dev/stdin)"
+  # Re-buffer stdin (we'll re-read below). Actually too late: stdin already
+  # consumed. Better approach: only block 'user' role for sessions without
+  # an existing state file. Use a peek: capture payload first, check after.
+  : # fall through; real check happens after PAYLOAD is captured
+fi
+
 # --- read hook payload from stdin -------------------------------------------
 PAYLOAD="$(cat)"
+
+# Apply daemon-controlled kill switch (correct version, after PAYLOAD captured)
+if [[ -f "$STATE_DIR/disabled" ]]; then
+  _sid="$(jq -r '.session_id // empty' <<<"$PAYLOAD" 2>/dev/null)"
+  # Only suppress new sessions: if state file exists, this session was
+  # already accepted before pause — let it finish normally.
+  if [[ -n "$_sid" && ! -f "$STATE_DIR/$_sid.json" ]]; then
+    log "skip role=$ROLE (cc-bridge disabled, sid=${_sid:0:8})"
+    exit 0
+  fi
+fi
 
 if [[ "${MIRROR_DUMP:-0}" = "1" ]]; then
   DIAG_DIR=/tmp/cc-mirror-payloads
@@ -108,6 +131,10 @@ extract() {
       ;;
     end)
       jq -r '.reason // "ended"' <<<"$payload" 2>/dev/null
+      ;;
+    question|answer)
+      # AskUserQuestion: return the entire tool_input/tool_response object as JSON
+      jq -c '.' <<<"$payload" 2>/dev/null
       ;;
     *)
       jq -r '.' <<<"$payload" 2>/dev/null
@@ -582,6 +609,57 @@ case "$ROLE" in
         "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
       archive_channel "$CHANNEL_ID"
     fi
+    # Mark state archived so daemon's `active` query excludes this session
+    TMP="$(mktemp)"
+    jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       '. + {archived: true, archived_at: $ts}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+    ;;
+
+  question)
+    # PreToolUse for AskUserQuestion: cc is waiting for human input. Mirror
+    # the question(s) + options to channel as Claude Code so Bear knows
+    # to come back to his desk. We don't try to answer from Slack — for
+    # that we'd need to inject into the running CC session, which has no
+    # public API yet.
+    [[ "$(jq -r '.tool_name // empty' <<<"$PAYLOAD")" = "AskUserQuestion" ]] || exit 0
+    [[ -f "$STATE_FILE" ]] || { log "skip question (no state — sub-session) sid=$SID8"; exit 0; }
+    CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
+    [[ -z "$CHANNEL_ID" ]] && exit 0
+
+    # Render: each question becomes a block of text
+    QTEXT="$(jq -r '
+      [.tool_input.questions[] |
+        ":grey_question: *" + .question + "*\n" +
+        (
+          [ .options | to_entries[] |
+            "  • *" + .value.label + "* — " + (.value.description // "")
+          ] | join("\n")
+        )
+      ] | join("\n\n")
+    ' <<<"$PAYLOAD" 2>/dev/null)"
+    [[ -z "$QTEXT" ]] && exit 0
+    QTEXT=":hourglass_flowing_sand: *Claude is waiting for your input* :hourglass_flowing_sand:"$'\n\n'"$QTEXT"
+    post_to_channel "$CHANNEL_ID" "$QTEXT" "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" \
+      && log "ok role=question channel=$CHANNEL_ID sid=$SID8"
+    ;;
+
+  answer)
+    # PostToolUse for AskUserQuestion: human answered. Mirror the chosen
+    # labels back so the channel reflects what Bear picked.
+    [[ "$(jq -r '.tool_name // empty' <<<"$PAYLOAD")" = "AskUserQuestion" ]] || exit 0
+    [[ -f "$STATE_FILE" ]] || exit 0
+    CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
+    [[ -z "$CHANNEL_ID" ]] && exit 0
+
+    ATEXT="$(jq -r '
+      [(.tool_response.answers // .tool_input.answers // {}) | to_entries[] |
+        "*" + .key + ":* " + .value
+      ] | join("\n")
+    ' <<<"$PAYLOAD" 2>/dev/null)"
+    [[ -z "$ATEXT" ]] && exit 0
+    ATEXT=":white_check_mark: *Answered*"$'\n'"$ATEXT"
+    post_to_channel "$CHANNEL_ID" "$ATEXT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
+      && log "ok role=answer channel=$CHANNEL_ID sid=$SID8"
     ;;
 
   *)

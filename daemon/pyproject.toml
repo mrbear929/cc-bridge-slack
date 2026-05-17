@@ -1,0 +1,9 @@
+[project]
+name = "cc-bridge-daemon"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "keyring>=25.0,<26",
+    "slack-bolt>=1.21,<2",
+    "slack-sdk>=3.30,<4",
+]
