@@ -317,12 +317,17 @@ case "$ROLE" in
     ;;
 
   assistant)
-    # Channel must exist (user prompt should have come first); if not, create it.
-    CHANNEL_ID=""
-    [[ -f "$STATE_FILE" ]] && CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
+    # If no state file exists, the user prompt was filtered as noise (CC
+    # internal sub-session: title generation, todo regen, summarization).
+    # Skip — don't create a channel for sub-sessions.
+    if [[ ! -f "$STATE_FILE" ]]; then
+      log "skip assistant (no state — sub-session) sid=$SID8"
+      exit 0
+    fi
+    CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
     if [[ -z "$CHANNEL_ID" ]]; then
-      CHANNEL_ID="$(ensure_channel "$SID" "$CHANNEL_PLACEHOLDER" "$SESSION_CWD" "$TRANSCRIPT_PATH")"
-      [[ -z "$CHANNEL_ID" ]] && exit 0
+      log "skip assistant (state file but no channel_id) sid=$SID8"
+      exit 0
     fi
 
     # First reply: SYNCHRONOUSLY rename channel before posting, so the
@@ -349,8 +354,10 @@ case "$ROLE" in
     ;;
 
   end)
+    # No state means we never created a channel for this session — nothing
+    # to archive. Common case: cc-internal sub-session.
     if [[ ! -f "$STATE_FILE" ]]; then
-      log "skip end (no state file) sid=$SID8"
+      log "skip end (no state — sub-session) sid=$SID8"
       exit 0
     fi
     CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
