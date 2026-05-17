@@ -241,17 +241,22 @@ sys.stdout.write(text)
 # Cap: 5 MB per image. Skips silently on missing transcript / decode errors.
 upload_user_images() {
   local transcript="$1" channel="$2" prompt_text="$3"
-  [[ -z "$transcript" || ! -f "$transcript" ]] && return 0
+  [[ -z "$transcript" ]] && return 0
   [[ -z "$prompt_text" ]] && return 0
 
   local extract_dir
   extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/cc-bridge-imgs.XXXXXX")" || return 0
 
-  # Wait up to ~6 seconds for the user message matching this prompt to appear
-  # in the transcript with image content. If the prompt has no images, we'll
-  # exit early once we find the matching user message text without images.
+  # Retry up to ~90 seconds for (a) the transcript file to appear AND (b)
+  # the user message matching this prompt to land in it with image content.
+  # Claudian buffers transcript writes; can take 30+ seconds for first turn.
+  # We're called in the background so latency here doesn't matter much.
   local found=0
-  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  for attempt in $(seq 1 60); do
+    if [[ ! -f "$transcript" ]]; then
+      sleep 1.5
+      continue
+    fi
     python3 - "$transcript" "$extract_dir" "$prompt_text" >/dev/null 2>&1 <<'PY'
 import json, sys, base64, os
 transcript_path, out_dir, anchor = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -325,7 +330,7 @@ PY
       break
     fi
     # rc==2 means transcript hasn't caught up — sleep and retry
-    sleep 0.5
+    sleep 1.5
   done
 
   if [[ $found -ne 1 ]]; then
@@ -480,10 +485,14 @@ case "$ROLE" in
     post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
       && log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
 
-    # Synchronous image upload: anchor-match this exact prompt against the
-    # transcript so we never associate someone else's image with this msg.
+    # Background image upload: Claudian buffers the transcript and flushes
+    # only after the first round-trip completes — sometimes 30+ seconds.
+    # Sync wait would block the hook past CC's 60s timeout AND delay the
+    # prompt appearing in Slack. So fork a detached worker that retries up
+    # to ~90 seconds. The image lands in Slack a few seconds (or up to a
+    # minute) after the prompt — close enough that they read together.
     if [[ -n "$TRANSCRIPT_PATH" ]]; then
-      upload_user_images "$TRANSCRIPT_PATH" "$CHANNEL_ID" "$CONTENT"
+      ( upload_user_images "$TRANSCRIPT_PATH" "$CHANNEL_ID" "$CONTENT" >/dev/null 2>&1 & disown ) 2>/dev/null
     fi
 
     # Save first prompt for later title generation
