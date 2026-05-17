@@ -235,27 +235,42 @@ sys.stdout.write(text)
 '
 }
 
-# Upload images from the most recent user message in the transcript to a
-# Slack channel. Synchronous — adds 1-2s per image to the user post path.
-# Hooks payload doesn't include image data (only the .prompt string), so we
-# parse them out of the JSONL transcript. Uses Slack files.upload_v2 flow.
-#
-# Args: $1 = transcript_path, $2 = channel_id
+# Upload images from the user message MATCHING the given prompt text.
+# Synchronous; retries internally until the transcript catches up.
+# Args: $1 = transcript_path, $2 = channel_id, $3 = prompt text (anchor)
 # Cap: 5 MB per image. Skips silently on missing transcript / decode errors.
 upload_user_images() {
-  local transcript="$1" channel="$2"
+  local transcript="$1" channel="$2" prompt_text="$3"
   [[ -z "$transcript" || ! -f "$transcript" ]] && return 0
+  [[ -z "$prompt_text" ]] && return 0
 
-  # Extract base64 images from the LAST user message that has any. Latest-only
-  # avoids re-uploading on every prompt.
   local extract_dir
   extract_dir="$(mktemp -d "${TMPDIR:-/tmp}/cc-bridge-imgs.XXXXXX")" || return 0
 
-  python3 - "$transcript" "$extract_dir" >/dev/null <<'PY' 2>/dev/null
+  # Wait up to ~6 seconds for the user message matching this prompt to appear
+  # in the transcript with image content. If the prompt has no images, we'll
+  # exit early once we find the matching user message text without images.
+  local found=0
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    python3 - "$transcript" "$extract_dir" "$prompt_text" >/dev/null 2>&1 <<'PY'
 import json, sys, base64, os
-transcript_path, out_dir = sys.argv[1], sys.argv[2]
+transcript_path, out_dir, anchor = sys.argv[1], sys.argv[2], sys.argv[3]
 
-last_user_with_images = None
+# Find the user message whose .message.content includes a text block whose
+# text starts with the anchor (the .prompt the hook saw). Then extract any
+# image content from that same message.
+target = None
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                parts.append(c.get("text", ""))
+        return "\n".join(parts)
+    return ""
+
 with open(transcript_path) as f:
     for line in f:
         try:
@@ -264,18 +279,25 @@ with open(transcript_path) as f:
             continue
         if d.get("type") != "user":
             continue
-        msg = d.get("message", {})
-        content = msg.get("content") if isinstance(msg, dict) else None
-        if not isinstance(content, list):
-            continue
-        if any(c.get("type") == "image" for c in content if isinstance(c, dict)):
-            last_user_with_images = content
+        msg = d.get("message", {}) if isinstance(d.get("message"), dict) else {}
+        content = msg.get("content")
+        # Match if the anchor is a substring of the joined text content
+        # (Claudian sometimes wraps prompts with editor_selection tags etc.)
+        if anchor and anchor[:80] in text_of(content):
+            target = content
+            # don't break — keep last match (most recent identical prompt wins)
 
-if not last_user_with_images:
-    sys.exit(0)
+if not target:
+    # No matching user message yet — signal "retry"
+    sys.exit(2)
 
+# We found the right user message. Extract images (or none).
+if not isinstance(target, list):
+    sys.exit(0)  # no images, done — no retry needed
+
+found_any = False
 idx = 0
-for c in last_user_with_images:
+for c in target:
     if not isinstance(c, dict) or c.get("type") != "image":
         continue
     src = c.get("source", {})
@@ -291,11 +313,26 @@ for c in last_user_with_images:
     if len(raw) > 5 * 1024 * 1024:
         continue
     idx += 1
+    found_any = True
     path = os.path.join(out_dir, f"image-{idx}.{ext}")
     with open(path, "wb") as out:
         out.write(raw)
-    print(path)
+sys.exit(0 if found_any or idx == 0 else 0)
 PY
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+      found=1
+      break
+    fi
+    # rc==2 means transcript hasn't caught up — sleep and retry
+    sleep 0.5
+  done
+
+  if [[ $found -ne 1 ]]; then
+    log "image upload: gave up waiting for transcript anchor (sid=$SID8)"
+    rm -rf "$extract_dir"
+    return 0
+  fi
 
   for img_path in "$extract_dir"/*; do
     [[ ! -f "$img_path" ]] && continue
@@ -443,15 +480,10 @@ case "$ROLE" in
     post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
       && log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
 
-    # Synchronous image upload from transcript (5MB cap, latest user msg only).
-    # Hook fires concurrently with transcript write; retry briefly if needed.
-    if [[ -n "$TRANSCRIPT_PATH" && -f "$TRANSCRIPT_PATH" ]]; then
-      # Wait up to 2s for the user message with image content to land in transcript
-      for _ in 1 2 3 4; do
-        if grep -q '"type":"image"' "$TRANSCRIPT_PATH" 2>/dev/null; then break; fi
-        sleep 0.5
-      done
-      upload_user_images "$TRANSCRIPT_PATH" "$CHANNEL_ID"
+    # Synchronous image upload: anchor-match this exact prompt against the
+    # transcript so we never associate someone else's image with this msg.
+    if [[ -n "$TRANSCRIPT_PATH" ]]; then
+      upload_user_images "$TRANSCRIPT_PATH" "$CHANNEL_ID" "$CONTENT"
     fi
 
     # Save first prompt for later title generation
