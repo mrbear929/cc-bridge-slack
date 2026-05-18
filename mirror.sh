@@ -766,7 +766,10 @@ case "$ROLE" in
     if [[ -n "$CHANNEL_ID" ]]; then
       post_to_channel "$CHANNEL_ID" "_session ended ($CONTENT)_" \
         "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
-      archive_channel "$CHANNEL_ID"
+      # NOTE: don't archive the Slack channel here. Channels stay
+      # active in the sidebar for ~7 days so the user can find / reply
+      # to recent sessions without hunting through archived. Daemon's
+      # archive sweeper handles late archive based on archived_at.
     fi
     safe_state_update "$SID" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        '. + {archived: true, archived_at: $ts, archived_by: "session-end"}'
