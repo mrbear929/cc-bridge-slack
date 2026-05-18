@@ -38,12 +38,46 @@ CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
 PROMPT="$(jq -r '.first_prompt // empty' "$STATE_FILE")"
 REPLY="$(jq -r '.first_reply // empty' "$STATE_FILE")"
 CWD="$(jq -r '.cwd // empty' "$STATE_FILE")"
+SURFACE="$(jq -r '.surface // empty' "$STATE_FILE")"
 CWD_BASENAME="$(basename "$CWD")"
 MIRROR_TAG="${MIRROR_TAG:-cc}"
 
 if [[ -z "$CHANNEL_ID" || -z "$PROMPT" ]]; then
   log "missing channel or prompt"
   exit 0
+fi
+
+# === Fast path: piggyback on Claudian's own title ===
+# realclaudian plugin writes session metadata to:
+#   <vault>/.claudian/sessions/conv-<ts>-<id>.meta.json
+# Each meta.json has {sessionId: <cc-sid>, title: "Imperative phrase"}.
+# If we're a Claudian-surface session, find the meta.json with our sid
+# and reuse its title — saves a Bedrock call AND keeps us perfectly in
+# sync with Claudian's sidebar.
+TITLE_FULL=""
+if [[ "$SURFACE" = "obsidian-claudian" && -d "$CWD/.claudian/sessions" ]]; then
+  for attempt in 1 2 3 4 5 6; do
+    # Find the meta file pointing at our sid AND with title generated
+    META=$(grep -lF "\"sessionId\": \"$SID\"" "$CWD"/.claudian/sessions/*.meta.json 2>/dev/null | head -1)
+    if [[ -n "$META" ]]; then
+      STATUS=$(jq -r '.titleGenerationStatus // empty' "$META" 2>/dev/null)
+      CANDIDATE=$(jq -r '.title // empty' "$META" 2>/dev/null)
+      # Skip placeholder titles like "Start a new conversation" until real one appears
+      if [[ "$STATUS" = "success" && -n "$CANDIDATE" && "$CANDIDATE" != "Start a new conversation" ]]; then
+        TITLE_FULL="$CANDIDATE"
+        log "reused Claudian title: $TITLE_FULL"
+        break
+      fi
+    fi
+    sleep 1
+  done
+fi
+
+# === Bedrock fallback ===
+# Reached only for non-Claudian surfaces (terminal CC, iterm, native) or
+# when the Claudian title isn't ready/available within the wait window.
+if [[ -n "$TITLE_FULL" ]]; then
+  TITLE_RAW="$TITLE_FULL"
 fi
 
 # Build Bedrock request. Use Haiku 4.5 — fast and cheap.
@@ -66,30 +100,31 @@ REQUEST_BODY="$(jq -nc \
     }]
   }')"
 
-# Write to temp file because aws cli is picky about --body
-REQ_FILE="$(mktemp)"
-RESP_FILE="$(mktemp)"
-printf '%s' "$REQUEST_BODY" >"$REQ_FILE"
+if [[ -z "${TITLE_RAW:-}" ]]; then
+  # Write to temp file because aws cli is picky about --body
+  REQ_FILE="$(mktemp)"
+  RESP_FILE="$(mktemp)"
+  printf '%s' "$REQUEST_BODY" >"$REQ_FILE"
 
-# Use the same AWS profile CC uses (from main settings.json env block)
-AWS_REGION_VAL="${AWS_REGION:-us-west-2}"
-AWS_PROFILE_VAL="${AWS_PROFILE:-claude-code-DO-NOT-DELETE}"
-MODEL_ID="us.anthropic.claude-haiku-4-5-20251001-v1:0"
+  AWS_REGION_VAL="${AWS_REGION:-us-west-2}"
+  AWS_PROFILE_VAL="${AWS_PROFILE:-claude-code-DO-NOT-DELETE}"
+  MODEL_ID="us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
-if ! AWS_PROFILE="$AWS_PROFILE_VAL" AWS_REGION="$AWS_REGION_VAL" \
-  aws bedrock-runtime invoke-model \
-  --model-id "$MODEL_ID" \
-  --content-type application/json \
-  --accept application/json \
-  --body "fileb://$REQ_FILE" \
-  "$RESP_FILE" >/dev/null 2>>"$LOG_FILE"; then
-  log "bedrock invoke failed (model=$MODEL_ID)"
+  if ! AWS_PROFILE="$AWS_PROFILE_VAL" AWS_REGION="$AWS_REGION_VAL" \
+    aws bedrock-runtime invoke-model \
+    --model-id "$MODEL_ID" \
+    --content-type application/json \
+    --accept application/json \
+    --body "fileb://$REQ_FILE" \
+    "$RESP_FILE" >/dev/null 2>>"$LOG_FILE"; then
+    log "bedrock invoke failed (model=$MODEL_ID)"
+    rm -f "$REQ_FILE" "$RESP_FILE"
+    exit 0
+  fi
+
+  TITLE_RAW="$(jq -r '.content[0].text // empty' "$RESP_FILE" 2>/dev/null)"
   rm -f "$REQ_FILE" "$RESP_FILE"
-  exit 0
 fi
-
-TITLE_RAW="$(jq -r '.content[0].text // empty' "$RESP_FILE" 2>/dev/null)"
-rm -f "$REQ_FILE" "$RESP_FILE"
 
 if [[ -z "$TITLE_RAW" ]]; then
   log "empty title from bedrock"
