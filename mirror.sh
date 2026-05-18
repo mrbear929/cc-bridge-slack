@@ -574,8 +574,30 @@ case "$ROLE" in
   user)
     CHANNEL_ID="$(ensure_channel "$SID" "$CHANNEL_PLACEHOLDER" "$SESSION_CWD" "$TRANSCRIPT_PATH")"
     [[ -z "$CHANNEL_ID" ]] && exit 0
-    post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
-      && log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
+
+    # Mark session busy: daemon uses this to queue inbound Slack messages
+    # rather than racing the live cc process. Cleared on Stop.
+    if [[ -f "$STATE_FILE" ]]; then
+      TMP="$(mktemp)"
+      jq '. + {busy: true}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+    fi
+
+    # When daemon's reply-routing spawned this turn, the user's prompt is
+    # already in Slack as their xzixuan message — skip mirror to avoid a
+    # duplicate Bear post.
+    # Daemon's reply-routing creates a marker file before spawning
+    # `claude -p --resume`. mirror.sh inside that subprocess sees the
+    # marker and skips: posting Bear (would duplicate the user's
+    # original Slack message) and archiving on SessionEnd (resume's
+    # SessionEnd is not a real exit). Env var was tried first but CC
+    # strips env when spawning hooks — file marker survives.
+    FROM_SLACK_MARKER="$STATE_DIR/from-slack/$SID"
+    if [[ -f "$FROM_SLACK_MARKER" ]] || [[ "${CC_BRIDGE_FROM_SLACK:-0}" = "1" ]]; then
+      log "skip user mirror (from-slack inject) sid=$SID8"
+    else
+      post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
+        && log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
+    fi
 
     # Background image upload: Claudian buffers the transcript and flushes
     # only after the first round-trip completes — sometimes 30+ seconds.
@@ -632,6 +654,12 @@ case "$ROLE" in
 
     post_to_channel "$CHANNEL_ID" "$CONTENT" "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" \
       && log "ok role=assistant channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
+
+    # Mark session idle so daemon can drain any queued Slack messages.
+    if [[ -f "$STATE_FILE" ]]; then
+      TMP="$(mktemp)"
+      jq '. + {busy: false}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+    fi
     ;;
 
   end)
@@ -639,6 +667,16 @@ case "$ROLE" in
     # to archive. Common case: cc-internal sub-session.
     if [[ ! -f "$STATE_FILE" ]]; then
       log "skip end (no state — sub-session) sid=$SID8"
+      exit 0
+    fi
+
+    # Skip archive if this SessionEnd comes from a daemon-spawned
+    # `claude -p --resume` inject — that's not the user closing the
+    # session, just the resume subprocess finishing. The daemon writes
+    # a marker before spawning, removes it after.
+    FROM_SLACK_MARKER="$STATE_DIR/from-slack/$SID"
+    if [[ -f "$FROM_SLACK_MARKER" ]] || [[ "${CC_BRIDGE_FROM_SLACK:-0}" = "1" ]]; then
+      log "skip end (from-slack inject — not a real exit) sid=$SID8"
       exit 0
     fi
 

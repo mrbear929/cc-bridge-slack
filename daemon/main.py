@@ -95,15 +95,142 @@ def set_enabled(enabled: bool) -> None:
 app = App(token=get_bot_token())
 
 
+def enqueue(sid: str, text: str, channel_id: str, ts: str) -> None:
+    """Append a queued message to the per-session queue file."""
+    qdir = STATE_DIR / "queue"
+    qdir.mkdir(exist_ok=True)
+    qfile = qdir / f"{sid}.jsonl"
+    with qfile.open("a") as f:
+        f.write(json.dumps({"text": text, "channel_id": channel_id, "ts": ts}) + "\n")
+
+
+def drain_queue_for_sid(sid: str) -> None:
+    """Run any pending queued messages for sid through claude -p --resume.
+    Called from the queue drainer thread when it observes busy=false."""
+    qfile = STATE_DIR / "queue" / f"{sid}.jsonl"
+    if not qfile.exists():
+        return
+    state_file = STATE_DIR / f"{sid}.json"
+    if not state_file.exists():
+        return
+    try:
+        state = json.loads(state_file.read_text())
+    except json.JSONDecodeError:
+        return
+
+    # Atomically claim queue contents
+    queued_lines = qfile.read_text().splitlines()
+    qfile.unlink(missing_ok=True)
+    if not queued_lines:
+        return
+
+    log.info("draining %d queued message(s) for sid=%s", len(queued_lines), sid[:8])
+
+    cwd = state.get("cwd") or os.path.expanduser("~")
+    if not os.path.isdir(cwd):
+        cwd = os.path.expanduser("~")
+    child_env = os.environ.copy()
+    for k in list(child_env.keys()):
+        if k.startswith("CLAUDE_CODE_") or k == "CLAUDECODE" or k == "AI_AGENT":
+            del child_env[k]
+    # Tell mirror.sh hooks this turn was injected from Slack; user prompt
+    # mirror should be skipped (your xzixuan message is already there).
+    child_env["CC_BRIDGE_FROM_SLACK"] = "1"
+
+    # File-based marker (env vars don't survive CC's hook spawn).
+    marker_dir = STATE_DIR / "from-slack"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / sid
+
+    for raw in queued_lines:
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        text = entry["text"]
+        channel_id = entry["channel_id"]
+        ts = entry["ts"]
+        try:
+            app.client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=ts)
+        except Exception:
+            pass
+        try:
+            marker.touch()
+            result = subprocess.run(
+                ["claude", "-p", "--resume", sid, "--output-format", "text", text],
+                capture_output=True, text=True, timeout=600, env=child_env, cwd=cwd,
+            )
+            if result.returncode != 0:
+                log.error("queued claude -p exit=%d stderr=%s", result.returncode, result.stderr[:300])
+        except Exception as e:
+            log.error("queued claude -p crashed: %s", e)
+        finally:
+            marker.unlink(missing_ok=True)
+        try:
+            app.client.reactions_add(channel=channel_id, name="white_check_mark", timestamp=ts)
+        except Exception:
+            pass
+
+
+def queue_drain_loop() -> None:
+    """Watch state files; whenever a session has queued messages and busy=false,
+    drain them. Polls every 2s — short enough that idle gaps get used, long
+    enough not to thrash the file system."""
+    import time
+    while True:
+        try:
+            qdir = STATE_DIR / "queue"
+            if qdir.exists():
+                for qfile in qdir.glob("*.jsonl"):
+                    sid = qfile.stem
+                    state_file = STATE_DIR / f"{sid}.json"
+                    if not state_file.exists():
+                        # state gone (session archived) — flush queue
+                        qfile.unlink(missing_ok=True)
+                        continue
+                    try:
+                        state = json.loads(state_file.read_text())
+                    except json.JSONDecodeError:
+                        continue
+                    if state.get("busy"):
+                        continue  # still mid-turn
+                    drain_queue_for_sid(sid)
+        except Exception as e:
+            log.error("queue drain loop crashed: %s", e)
+        time.sleep(2)
+
+
 def channel_to_session(channel_id: str) -> dict[str, Any] | None:
-    """Find the state file for a channel id. Returns full state dict or None."""
+    """Find the state file for a channel id. Returns full state dict or None.
+
+    If the state file says archived but Slack-side the channel was just
+    unarchived (e.g. user manually clicked unarchive), trust the Slack
+    side: clear the archived flag in state and return the dict. This
+    handles the case where Bear unarchives an old session channel and
+    expects to be able to inject prompts via Slack.
+    """
     for f in STATE_DIR.glob("*.json"):
         try:
             d = json.loads(f.read_text())
         except json.JSONDecodeError:
             continue
-        if d.get("channel_id") == channel_id and not d.get("archived"):
-            return d
+        if d.get("channel_id") != channel_id:
+            continue
+        if d.get("archived"):
+            # Verify with Slack — if channel is unarchived, sync state and proceed.
+            try:
+                resp = app.client.conversations_info(channel=channel_id)
+                if not resp["channel"].get("is_archived"):
+                    log.info("state stale: %s says archived but slack says unarchived — syncing", channel_id)
+                    d.pop("archived", None)
+                    d.pop("archived_at", None)
+                    d.pop("archived_by", None)
+                    f.write_text(json.dumps(d, indent=2))
+                    return d
+            except Exception as e:
+                log.warning("could not verify channel state: %s", e)
+            return None
+        return d
     return None
 
 
@@ -178,11 +305,21 @@ def on_message(event: dict[str, Any], client, say) -> None:
     sid = state["session_id"]
     log.info("reply route channel=%s sid=%s text=%r", channel_id, sid[:8], text[:60])
 
-    # Ack with reaction (synchronous, before launching the subprocess)
+    # Ack with reaction. Reactions encode all status: hourglass = pending
+    # (queued or running), check = done. No text messages are posted —
+    # those would clutter the channel with bot chatter and confuse the
+    # "latest message tells you cc state" UX.
     try:
         client.reactions_add(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
     except Exception as e:
         log.warning("could not add ack reaction: %s", e)
+
+    # If the session is currently busy (a turn is mid-flight from terminal/
+    # Claudian or a previous queued resume), queue and let the drain loop
+    # pick it up after Stop fires. Reaction stays as :hourglass: until done.
+    if state.get("busy"):
+        enqueue(sid, text, channel_id, event_ts)
+        return
 
     def runner() -> None:
         try:
@@ -199,26 +336,51 @@ def on_message(event: dict[str, Any], client, say) -> None:
             if not os.path.isdir(cwd):
                 cwd = os.path.expanduser("~")
 
-            result = subprocess.run(
-                ["claude", "-p", "--resume", sid, "--output-format", "text", text],
-                capture_output=True,
-                text=True,
-                timeout=600,
-                env=child_env,
-                cwd=cwd,
-            )
+            # File-based marker survives CC's env stripping when it spawns
+            # hooks. mirror.sh checks for $STATE_DIR/from-slack/<sid> and
+            # skips both the user-prompt mirror (xzixuan message is already
+            # in the channel) and the SessionEnd archive (resume's
+            # SessionEnd is not a real exit).
+            marker_dir = STATE_DIR / "from-slack"
+            marker_dir.mkdir(parents=True, exist_ok=True)
+            marker = marker_dir / sid
+            marker.touch()
+            try:
+                result = subprocess.run(
+                    ["claude", "-p", "--resume", sid, "--output-format", "text", text],
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    env=child_env,
+                    cwd=cwd,
+                )
+            finally:
+                marker.unlink(missing_ok=True)
             if result.returncode != 0:
                 log.error("claude -p exit=%d stderr=%s", result.returncode, result.stderr[:500])
-                client.chat_postMessage(
-                    channel=channel_id,
-                    text=f":x: Inject failed: `{result.stderr.splitlines()[-1] if result.stderr else 'unknown error'}`",
-                )
+                # No text message — failure shows as :x: reaction instead
+                try:
+                    client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
+                    client.reactions_add(channel=channel_id, name="x", timestamp=event_ts)
+                except Exception:
+                    pass
+                return
         except subprocess.TimeoutExpired:
             log.error("claude -p timed out 600s sid=%s", sid[:8])
-            client.chat_postMessage(channel=channel_id, text=":x: Inject timed out (>10 min)")
+            try:
+                client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
+                client.reactions_add(channel=channel_id, name="alarm_clock", timestamp=event_ts)
+            except Exception:
+                pass
+            return
         except Exception as e:
             log.error("claude -p exception sid=%s: %s", sid[:8], e)
-            client.chat_postMessage(channel=channel_id, text=f":x: Inject crashed: `{e}`")
+            try:
+                client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
+                client.reactions_add(channel=channel_id, name="boom", timestamp=event_ts)
+            except Exception:
+                pass
+            return
         finally:
             try:
                 client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
@@ -356,6 +518,10 @@ def main() -> None:
     # guard, real exits archive cleanly). Reopening an old session
     # auto-unarchives via mirror.sh ensure_channel.
     # threading.Thread(target=sweep_dead_sessions, daemon=True).start()
+
+    # Queue drain loop: dispatch queued Slack messages whenever the
+    # destination session goes idle (busy=false flipped by Stop hook).
+    threading.Thread(target=queue_drain_loop, daemon=True).start()
 
     handler = SocketModeHandler(app, get_app_token())
     handler.start()
