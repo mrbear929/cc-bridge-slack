@@ -46,20 +46,23 @@ if [[ -z "$CHANNEL_ID" || -z "$PROMPT" ]]; then
   exit 0
 fi
 
-# Build Bedrock request. Use Haiku 3.5 — fast and cheap.
+# Build Bedrock request. Use Haiku 4.5 — fast and cheap.
 # Trim inputs (channel-name material doesn't need full prompt).
 PROMPT_SHORT="${PROMPT:0:1500}"
 REPLY_SHORT="${REPLY:0:1500}"
 
+# Ask for one Claudian-style title sentence. Length 30-60 chars typical.
+# We sanitize-and-truncate it ourselves into a kebab slug for channel name,
+# and use the original sentence verbatim as the channel topic.
 REQUEST_BODY="$(jq -nc \
   --arg p "$PROMPT_SHORT" \
   --arg r "$REPLY_SHORT" \
   '{
     anthropic_version: "bedrock-2023-05-31",
-    max_tokens: 30,
+    max_tokens: 60,
     messages: [{
       role: "user",
-      content: ("Generate a 2-4 word title in lowercase kebab-case (a-z, 0-9, hyphens only) summarizing this Claude Code session. Be concise — fewer words is better. ONLY output the slug, no quotes, no explanation.\n\nUser prompt:\n" + $p + "\n\nClaude reply:\n" + $r)
+      content: ("Summarize this Claude Code session in a single short imperative sentence, the way Obsidian Claudian names conversations: title-case-ish, 4-8 words, no period, like \"Consolidate dev/ideas files into one MD\" or \"Design modern homepage for tools portfolio site\". ONLY output that one sentence, no quotes, no explanation.\n\nUser prompt:\n" + $p + "\n\nClaude reply:\n" + $r)
     }]
   }')"
 
@@ -93,25 +96,29 @@ if [[ -z "$TITLE_RAW" ]]; then
   exit 0
 fi
 
-# Sanitize: lowercase, replace spaces/underscores with hyphens, strip non-allowed
-TITLE_SLUG="$(printf '%s' "$TITLE_RAW" \
-  | tr '[:upper:]' '[:lower:]' \
-  | tr ' _' '-' \
-  | tr -cd 'a-z0-9-' \
-  | sed -E 's/^-+//; s/-+$//; s/-+/-/g' \
-  | cut -c1-30)"
+# Strip wrapping quotes/whitespace from model output
+TITLE_FULL="$(printf '%s' "$TITLE_RAW" \
+  | sed -E 's/^[[:space:]"'"'"']+//; s/[[:space:]"'"'"']+$//')"
 
-if [[ -z "$TITLE_SLUG" ]]; then
-  log "title slug empty after sanitize: '$TITLE_RAW'"
+if [[ -z "$TITLE_FULL" ]]; then
+  log "title empty after sanitize: '$TITLE_RAW'"
   exit 0
 fi
 
-# Channel name is just the title slug — no prefix. (Bedrock is asked for
-# 3-6 words; we cap at 50 chars to leave room for collision -2/-3 suffix.)
-NEW_NAME="$(printf '%s' "$TITLE_SLUG" \
+# Build channel-safe slug from the full title:
+# - lowercase
+# - everything non-[a-z0-9] -> hyphen
+# - collapse runs of hyphens, trim
+# - cut to 70 chars (Slack max 80, keep headroom for collision suffix)
+NEW_NAME="$(printf '%s' "$TITLE_FULL" \
   | tr '[:upper:]' '[:lower:]' \
-  | tr -cd 'a-z0-9-' \
-  | cut -c1-50)"
+  | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' \
+  | cut -c1-70)"
+
+if [[ -z "$NEW_NAME" ]]; then
+  log "slug empty after sanitize: '$TITLE_FULL'"
+  exit 0
+fi
 
 # Try rename, with -2/-3/-4 suffix on name_taken collision
 FINAL_NAME=""
@@ -132,8 +139,20 @@ done
 
 if [[ -n "$FINAL_NAME" ]]; then
   TMP="$(mktemp)"
-  jq --arg n "$FINAL_NAME" '.channel_name=$n | .renamed=true' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
-  log "renamed to $FINAL_NAME"
+  jq --arg n "$FINAL_NAME" --arg t "$TITLE_FULL" \
+    '.channel_name=$n | .title=$t | .renamed=true' \
+    "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+  log "renamed to $FINAL_NAME (title='$TITLE_FULL')"
+
+  # Replace topic with the human-readable title + cwd. (init message
+  # already has full surface/device/sid metadata; topic stays compact.)
+  CWD_TOPIC="$(jq -r '.cwd' "$STATE_FILE")"
+  TOPIC="$(printf '%s · %s' "$TITLE_FULL" "$CWD_TOPIC")"
+  curl -sS -X POST https://slack.com/api/conversations.setTopic \
+    -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+    -H 'Content-Type: application/json; charset=utf-8' \
+    --data "$(jq -nc --arg ch "$CHANNEL_ID" --arg t "$TOPIC" '{channel:$ch, topic:$t}')" \
+    >/dev/null 2>>"$LOG_FILE"
 else
   log "rename failed: $RESP"
 fi
