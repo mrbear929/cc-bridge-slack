@@ -242,8 +242,9 @@ ensure_channel() {
   jq -nc \
     --arg sid "$sid" --arg ch "$ch_id" --arg name "$placeholder" \
     --arg cwd "$cwd" --arg surface "$surface" --arg device "$hostname" \
+    --arg transcript "$transcript" \
     --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{session_id:$sid, channel_id:$ch, channel_name:$name, cwd:$cwd, surface:$surface, device:$device, created:$created, renamed:false}' \
+    '{session_id:$sid, channel_id:$ch, channel_name:$name, cwd:$cwd, surface:$surface, device:$device, transcript_path:$transcript, created:$created, renamed:false}' \
     >"$state_file"
 
   log "created channel $placeholder ($ch_id) sid=$sid surface=$surface"
