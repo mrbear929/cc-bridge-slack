@@ -795,9 +795,22 @@ case "$ROLE" in
       ] | join("\n\n")
     ' <<<"$PAYLOAD" 2>/dev/null)"
     [[ -z "$QTEXT" ]] && exit 0
-    QTEXT=":hourglass_flowing_sand: *Claude is waiting for your input* :hourglass_flowing_sand:"$'\n\n'"$QTEXT"
+    QTEXT=":grey_question: *Claude is waiting for your input* :grey_question:"$'\n\n'"$QTEXT"
     post_to_channel "$CHANNEL_ID" "$QTEXT" "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" \
       && log "ok role=question channel=$CHANNEL_ID sid=$SID8"
+
+    # AskUserQuestion blocks the local CC turn until the user clicks an
+    # option locally — there's no API to inject the answer remotely, and
+    # spawning `claude -p --resume` would race the local session.
+    # Keep busy=true so the daemon does NOT drain queued Slack messages
+    # (those wait for the answer hook), but swap the pending hourglass
+    # to :grey_question: so the phone viewer can see "this needs you at
+    # the desk" instead of "still running".
+    PENDING_TS="$(jq -r '.pending_user_ts // empty' "$STATE_FILE" 2>/dev/null)"
+    if [[ -n "$PENDING_TS" ]]; then
+      remove_reaction "$CHANNEL_ID" "$PENDING_TS" "hourglass_flowing_sand"
+      add_reaction    "$CHANNEL_ID" "$PENDING_TS" "grey_question"
+    fi
     ;;
 
   answer)
@@ -817,6 +830,15 @@ case "$ROLE" in
     ATEXT=":white_check_mark: *Answered*"$'\n'"$ATEXT"
     post_to_channel "$CHANNEL_ID" "$ATEXT" "$USER_DISPLAY_NAME" "$USER_ICON_URL" \
       && log "ok role=answer channel=$CHANNEL_ID sid=$SID8"
+
+    # Replace the :grey_question: on the pending user prompt now that
+    # the user answered locally. The model will resume its turn — the
+    # next Stop hook will swap to :white_check_mark: and clear pending.
+    PENDING_TS="$(jq -r '.pending_user_ts // empty' "$STATE_FILE" 2>/dev/null)"
+    if [[ -n "$PENDING_TS" ]]; then
+      remove_reaction "$CHANNEL_ID" "$PENDING_TS" "grey_question"
+      add_reaction    "$CHANNEL_ID" "$PENDING_TS" "hourglass_flowing_sand"
+    fi
     ;;
 
   *)
