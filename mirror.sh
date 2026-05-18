@@ -229,13 +229,13 @@ ensure_channel() {
     "$(jq -nc --arg ch "$ch_id" --arg u "$SLACK_USER_ID" '{channel:$ch, users:$u}')" >/dev/null
 
   # Post init message (multi-line, formatted)
-  local hostname now sid8
+  local hostname now transcript_dir
   hostname="$(scutil --get ComputerName 2>/dev/null || hostname -s)"
   now="$(date '+%H:%M (%Y-%m-%d)')"
-  sid8="${sid:0:8}"
+  transcript_dir="$(dirname "$transcript")"
   local init_text
-  init_text="$(printf '*Session start*\n• Started: %s\n• Surface: \`%s\`\n• Device: \`%s\`\n• Cwd: \`%s\`\n• Session: \`%s\`' \
-    "$now" "$surface" "$hostname" "$cwd" "$sid8")"
+  init_text="$(printf '*Session start*\n• Started: %s\n• Surface: \`%s\`\n• Device: \`%s\`\n• Cwd: \`%s\`\n• Session: \`%s\`\n• Transcript: \`%s\`' \
+    "$now" "$surface" "$hostname" "$cwd" "$sid" "$transcript")"
   post_to_channel "$ch_id" "$init_text" "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
 
   # Persist mapping (record surface for future status queries)
