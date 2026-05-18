@@ -795,17 +795,22 @@ case "$ROLE" in
       ] | join("\n\n")
     ' <<<"$PAYLOAD" 2>/dev/null)"
     [[ -z "$QTEXT" ]] && exit 0
-    QTEXT=":grey_question: *Claude is waiting for your input* :grey_question:"$'\n\n'"$QTEXT"
+    QTEXT=":grey_question: *Claude is waiting for your input* :grey_question:"$'\n\n'"$QTEXT" \
+"\n\n_Reply in this channel to inject your answer remotely (experimental)._"
     post_to_channel "$CHANNEL_ID" "$QTEXT" "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" \
       && log "ok role=question channel=$CHANNEL_ID sid=$SID8"
 
-    # AskUserQuestion blocks the local CC turn until the user clicks an
-    # option locally — there's no API to inject the answer remotely, and
-    # spawning `claude -p --resume` would race the local session.
-    # Keep busy=true so the daemon does NOT drain queued Slack messages
-    # (those wait for the answer hook), but swap the pending hourglass
-    # to :grey_question: so the phone viewer can see "this needs you at
-    # the desk" instead of "still running".
+    # Experimental: flip busy=false so daemon will drain any queued
+    # Slack messages — they get spawned via `claude -p --resume` and CC
+    # decides how to interpret them given the pending AskUserQuestion in
+    # the transcript. Worst case CC just opens a new turn instead of
+    # answering the tool call; transcript stays valid either way.
+    safe_state_update "$SID" '. + {busy: false}'
+
+    # Swap the pending hourglass on the user prompt to a question mark
+    # so the phone-side viewer sees "this is at AskUserQuestion" rather
+    # than "still chewing". The pending_user_ts stays in state so a
+    # later Stop hook can swap question-mark back to checkmark.
     PENDING_TS="$(jq -r '.pending_user_ts // empty' "$STATE_FILE" 2>/dev/null)"
     if [[ -n "$PENDING_TS" ]]; then
       remove_reaction "$CHANNEL_ID" "$PENDING_TS" "hourglass_flowing_sand"
