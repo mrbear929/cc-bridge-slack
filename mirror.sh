@@ -634,9 +634,12 @@ case "$ROLE" in
       exit 0
     fi
 
-    # First reply: SYNCHRONOUSLY rename channel before posting, so the
-    # message lands in an already-properly-named channel.
-    # Subsequent replies skip this entire block (no latency).
+    # First reply: kick off title generation as a detached background
+    # job. Used to be synchronous (1-3s before reply landed) — but
+    # Claudian's own title can lag 5-30s, and we want to reuse it
+    # rather than burn a Bedrock call. Detaching lets the reply post
+    # immediately; title-generator.sh patiently waits for Claudian's
+    # meta.json and renames the channel when ready.
     if [[ -f "$STATE_FILE" ]]; then
       RENAMED="$(jq -r '.renamed // false' "$STATE_FILE")"
       HAS_FIRST_REPLY="$(jq -r 'has("first_reply")' "$STATE_FILE")"
@@ -645,10 +648,8 @@ case "$ROLE" in
         jq --arg r "$CONTENT" '. + {first_reply:$r}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
         TITLE_GEN="$(dirname "$0")/title-generator.sh"
         if [[ -x "$TITLE_GEN" ]]; then
-          # Synchronous: title-generator returns when rename completes (or fails).
-          # Adds 1-3s to the FIRST reply only.
-          "$TITLE_GEN" "$SID" >/dev/null 2>&1
-          log "title-gen done sid=$SID8"
+          ( "$TITLE_GEN" "$SID" >/dev/null 2>&1 & disown ) 2>/dev/null
+          log "title-gen queued (background) sid=$SID8"
         fi
       fi
     fi

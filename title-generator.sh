@@ -56,7 +56,10 @@ fi
 # sync with Claudian's sidebar.
 TITLE_FULL=""
 if [[ "$SURFACE" = "obsidian-claudian" && -d "$CWD/.claudian/sessions" ]]; then
-  for attempt in 1 2 3 4 5 6; do
+  # Claudian generates titles asynchronously. Wait up to ~30s for it to
+  # land — Bedrock fallback only fires when Claudian truly didn't
+  # produce one.
+  for attempt in $(seq 1 30); do
     # Find the meta file pointing at our sid AND with title generated
     META=$(grep -lF "\"sessionId\": \"$SID\"" "$CWD"/.claudian/sessions/*.meta.json 2>/dev/null | head -1)
     if [[ -n "$META" ]]; then
