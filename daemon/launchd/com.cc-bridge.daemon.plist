@@ -3,13 +3,13 @@
   cc-bridge daemon launchd plist.
 
   Install:
-    cp launchd/com.bear.cc-bridge.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bear.cc-bridge.plist
-    launchctl enable gui/$(id -u)/com.bear.cc-bridge
+    cp launchd/com.cc-bridge.daemon.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-bridge.daemon.plist
+    launchctl enable gui/$(id -u)/com.cc-bridge.daemon
 
-  Start now:    launchctl kickstart -k gui/$(id -u)/com.bear.cc-bridge
-  Stop:         launchctl bootout gui/$(id -u)/com.bear.cc-bridge
-  Status:       launchctl print gui/$(id -u)/com.bear.cc-bridge | head -30
+  Start now:    launchctl kickstart -k gui/$(id -u)/com.cc-bridge.daemon
+  Stop:         launchctl bootout gui/$(id -u)/com.cc-bridge.daemon
+  Status:       launchctl print gui/$(id -u)/com.cc-bridge.daemon | head -30
 
   IMPORTANT: SLACK_APP_TOKEN must be set somewhere readable to launchd.
   Easiest: hardcode below from Apple Passwords. Or use a wrapper that
@@ -21,7 +21,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.bear.cc-bridge</string>
+    <string>com.cc-bridge.daemon</string>
 
     <key>ProgramArguments</key>
     <array>

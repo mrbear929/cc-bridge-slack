@@ -73,14 +73,15 @@ if [[ -f "$ENV_FILE" ]]; then
   gray "  (delete it manually if you want a fresh template)"
 else
   read -rp "Slack user ID (U... format, your member ID): " user_id
-  read -rp "Bear icon URL (https://ca.slack-edge.com/...): " bear_url
+  read -rp "Display name for your mirrored prompts (e.g. your first name): " user_name
+  read -rp "Avatar URL for your mirrored prompts (https://ca.slack-edge.com/...): " user_url
   read -rp "Claude icon URL (or empty for app default): " claude_url
   cat >"$ENV_FILE" <<ENVEOF
 # cc-bridge-slack runtime config (non-secret)
 # Bot token lives in macOS Keychain ($KEYCHAIN_SERVICE / $KEYCHAIN_ACCOUNT)
 SLACK_USER_ID=$user_id
-BEAR_DISPLAY_NAME="Bear"
-BEAR_ICON_URL="$bear_url"
+USER_DISPLAY_NAME="$user_name"
+USER_ICON_URL="$user_url"
 CLAUDE_DISPLAY_NAME="Claude Code"
 CLAUDE_ICON_URL="$claude_url"
 MIRROR_TAG="cc"
@@ -131,20 +132,20 @@ if command -v uv >/dev/null 2>&1; then
     red "✗ sync-to-launchd.sh failed; daemon will not be available"
   fi
 
-  PLIST_SRC="$REPO_DIR/daemon/launchd/com.bear.cc-bridge.plist"
-  PLIST_DEST="$HOME/Library/LaunchAgents/com.bear.cc-bridge.plist"
+  PLIST_SRC="$REPO_DIR/daemon/launchd/com.cc-bridge.daemon.plist"
+  PLIST_DEST="$HOME/Library/LaunchAgents/com.cc-bridge.daemon.plist"
   if [[ -f "$PLIST_DEST" ]]; then
     green "✓ launchd plist already installed at $PLIST_DEST"
     gray "  (overwriting with current source for any path/PATH updates)"
     cp "$PLIST_SRC" "$PLIST_DEST"
-    launchctl bootout "gui/$(id -u)/com.bear.cc-bridge" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/com.cc-bridge.daemon" 2>/dev/null || true
   else
     cp "$PLIST_SRC" "$PLIST_DEST"
     green "✓ copied plist to LaunchAgents"
   fi
 
   if launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" 2>/dev/null; then
-    launchctl enable "gui/$(id -u)/com.bear.cc-bridge" 2>/dev/null || true
+    launchctl enable "gui/$(id -u)/com.cc-bridge.daemon" 2>/dev/null || true
     green "✓ launchd service bootstrapped"
   else
     red "✗ launchctl bootstrap failed (already loaded? try kickstart -k)"

@@ -24,6 +24,6 @@ chmod +x "$DEST/run.sh"
 ( cd "$DEST" && uv sync --quiet )
 
 # Restart the daemon so new code is loaded
-launchctl kickstart -k "gui/$(id -u)/com.bear.cc-bridge"
+launchctl kickstart -k "gui/$(id -u)/com.cc-bridge.daemon"
 
 echo "✓ synced to $DEST and kicked launchd"

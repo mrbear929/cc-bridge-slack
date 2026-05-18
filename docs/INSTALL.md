@@ -134,20 +134,20 @@ service.
 Then register the launchd agent:
 
 ```bash
-cp daemon/launchd/com.bear.cc-bridge.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.bear.cc-bridge.plist
-launchctl enable gui/$(id -u)/com.bear.cc-bridge
+cp daemon/launchd/com.cc-bridge.daemon.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-bridge.daemon.plist
+launchctl enable gui/$(id -u)/com.cc-bridge.daemon
 ```
 
 Verify:
 
 ```bash
-launchctl print gui/$(id -u)/com.bear.cc-bridge | grep -E 'state|pid|last exit'
+launchctl print gui/$(id -u)/com.cc-bridge.daemon | grep -E 'state|pid|last exit'
 ```
 
 You want `state = running` and `last exit code = (never exited)`.
 
-If the plist's `Label` (currently `com.bear.cc-bridge`) conflicts with
+If the plist's `Label` (currently `com.cc-bridge.daemon`) conflicts with
 something else on your system, edit both the source plist and the file
 copied into `~/Library/LaunchAgents/`.
 
@@ -170,15 +170,15 @@ copied into `~/Library/LaunchAgents/`.
 
 ## 7 — Troubleshooting
 
-| Symptom | Likely cause |
-|---|---|
-| Hook log empty after CC prompt | Hooks not in `~/.claude/settings.json` (check you didn't put them in `settings.local.json` — that file ignores hooks) |
-| `daemon/run.sh: Operation not permitted` in launchd stderr | Source plist has WorkingDirectory pointing at `~/Documents/...` instead of `~/Library/Application Support/cc-bridge-daemon`. Re-run `sync-to-launchd.sh` and re-bootstrap. |
-| Daemon: `[Errno 2] No such file or directory: 'claude'` | launchd PATH doesn't include CC. Add the binary directory in the plist's `EnvironmentVariables/PATH`. |
-| Reply routing fails: `No conversation found with session ID` | The target session is currently active (a local CC owns the sid). Wait until it's idle or `/exit` to release. |
-| Reactions silently fail (`missing_scope: reactions:write`) | You didn't add the scope in step 1.3. Add it, **Reinstall** the app, restart the daemon. |
-| Channel name doesn't match Claudian sidebar | title-generator.sh waits 30 s for Claudian to publish its meta.json. If it's a long Claudian boot, retry by sending a fresh prompt. |
-| Bear-identity messages have wrong avatar | Avatar URL in env file expired (Slack edge URLs rotate yearly-ish). Get a fresh URL from your Slack profile and re-run `install.sh`. |
+| Symptom                                                      | Likely cause                                                                                                                                                               |
+| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hook log empty after CC prompt                               | Hooks not in `~/.claude/settings.json` (check you didn't put them in `settings.local.json` — that file ignores hooks)                                                      |
+| `daemon/run.sh: Operation not permitted` in launchd stderr   | Source plist has WorkingDirectory pointing at `~/Documents/...` instead of `~/Library/Application Support/cc-bridge-daemon`. Re-run `sync-to-launchd.sh` and re-bootstrap. |
+| Daemon: `[Errno 2] No such file or directory: 'claude'`      | launchd PATH doesn't include CC. Add the binary directory in the plist's `EnvironmentVariables/PATH`.                                                                      |
+| Reply routing fails: `No conversation found with session ID` | The target session is currently active (a local CC owns the sid). Wait until it's idle or `/exit` to release.                                                              |
+| Reactions silently fail (`missing_scope: reactions:write`)   | You didn't add the scope in step 1.3. Add it, **Reinstall** the app, restart the daemon.                                                                                   |
+| Channel name doesn't match Claudian sidebar                  | title-generator.sh waits 30 s for Claudian to publish its meta.json. If it's a long Claudian boot, retry by sending a fresh prompt.                                        |
+| User-identity messages have wrong avatar                     | Avatar URL in env file expired (Slack edge URLs rotate yearly-ish). Get a fresh URL from your Slack profile and re-run `install.sh`.                                       |
 
 ## 8 — Updating later
 

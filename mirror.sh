@@ -2,7 +2,7 @@
 # cc-bridge-slack/mirror.sh
 #
 # Claude Code hook handler. Mirrors CC session events to a per-session
-# private Slack channel in Bear's sandbox workspace.
+# private Slack channel in the user's Slack workspace.
 #
 # Wired into Claude Code via UserPromptSubmit, Stop, SessionEnd hooks
 # (see ~/.claude/settings.json). Runs in the same shell context as the CC
@@ -14,7 +14,7 @@
 #   - First UserPromptSubmit creates channel cc-<cwd>-<sid8> (placeholder)
 #   - Title-generation Stop fire renames channel to include CC's title
 #   - SessionEnd archives channel
-#   - User msgs post as Bear (with gravatar); assistant msgs post as
+#   - User msgs post as the user-identity override (avatar from env); assistant msgs post as
 #     "Claude Code" (with CC icon)
 #
 # Usage:
@@ -24,9 +24,9 @@
 #
 # Env (loaded from $ENV_FILE if present, default ~/.claude/tools/slack-bridge.env):
 #   SLACK_BOT_TOKEN        xoxb-...
-#   SLACK_USER_ID          U... (Bear's user id in sandbox)
-#   BEAR_DISPLAY_NAME      "Bear" (override Slack username for user posts)
-#   BEAR_ICON_URL          https://... (gravatar / Slack avatar URL)
+#   SLACK_USER_ID          U... (the user's Slack member id)
+#   USER_DISPLAY_NAME      "<name>" (override Slack username for user posts)
+#   USER_ICON_URL          https://... (gravatar / Slack avatar URL)
 #   CLAUDE_DISPLAY_NAME    "Claude Code"
 #   CLAUDE_ICON_URL        https://... (CC logo)
 #   MIRROR_TAG             prefix for placeholder channel names; default "cc"
@@ -52,8 +52,8 @@ fi
 [[ -n "$_inline_tag" ]] && MIRROR_TAG="$_inline_tag"
 MIRROR_TAG="${MIRROR_TAG:-cc}"
 MIRROR_DRY_RUN="${MIRROR_DRY_RUN:-0}"
-BEAR_DISPLAY_NAME="${BEAR_DISPLAY_NAME:-Bear}"
-BEAR_ICON_URL="${BEAR_ICON_URL:-}"
+USER_DISPLAY_NAME="${USER_DISPLAY_NAME:-You}"
+USER_ICON_URL="${USER_ICON_URL:-}"
 CLAUDE_DISPLAY_NAME="${CLAUDE_DISPLAY_NAME:-Claude Code}"
 CLAUDE_ICON_URL="${CLAUDE_ICON_URL:-https://www.anthropic.com/favicon.ico}"
 
@@ -259,7 +259,7 @@ ensure_channel() {
   slack_api conversations.setTopic \
     "$(jq -nc --arg ch "$ch_id" --arg t "$topic" '{channel:$ch, topic:$t}')" >/dev/null
 
-  # Invite Bear
+  # Invite the user
   slack_api conversations.invite \
     "$(jq -nc --arg ch "$ch_id" --arg u "$SLACK_USER_ID" '{channel:$ch, users:$u}')" >/dev/null
 
@@ -443,7 +443,7 @@ PY
 
     # Step 3: complete WITHOUT sharing to channel (no channel_id), so Slack
     # finalizes the file but doesn't post the system "bot uploaded a file"
-    # message. We'll share it ourselves as Bear in step 4.
+    # message. We share via chat.postMessage with the user-identity in step 4.
     local complete_body complete_resp ok permalink
     complete_body="$(jq -nc --arg fid "$file_id" --arg title "$fname" \
       '{files:[{id:$fid, title:$title}]}')"
@@ -459,7 +459,7 @@ PY
       continue
     fi
 
-    # Step 4: post as Bear with the permalink — Slack unfurls it inline.
+    # Step 4: post as user with the permalink — Slack unfurls it inline.
     # Use <url| > with empty visible text so the link itself is hidden
     # but Slack still unfurls it as the image preview underneath.
     local post_body post_resp post_ok
@@ -468,16 +468,16 @@ PY
     post_body="$(jq -nc \
       --arg ch "$channel" \
       --arg t "$hidden_link" \
-      --arg u "$BEAR_DISPLAY_NAME" \
-      --arg i "$BEAR_ICON_URL" \
+      --arg u "$USER_DISPLAY_NAME" \
+      --arg i "$USER_ICON_URL" \
       '{channel:$ch, text:$t, mrkdwn:true, username:$u, unfurl_links:true, unfurl_media:true}
        + (if $i != "" then {icon_url:$i} else {} end)')"
     post_resp="$(slack_api chat.postMessage "$post_body")"
     post_ok="$(jq -r '.ok' <<<"$post_resp" 2>/dev/null)"
     if [[ "$post_ok" = "true" ]]; then
-      log "image uploaded+posted $fname ($size bytes) as Bear in $channel"
+      log "image uploaded+posted $fname ($size bytes) as user in $channel"
     else
-      log "image upload step4 (post as Bear) failed: $post_resp"
+      log "image upload step4 (post as user) failed: $post_resp"
     fi
   done
 
@@ -642,10 +642,10 @@ case "$ROLE" in
 
     # When daemon's reply-routing spawned this turn, the user's prompt is
     # already in Slack as their xzixuan message — skip mirror to avoid a
-    # duplicate Bear post.
+    # duplicate user post.
     # Daemon's reply-routing creates a marker file before spawning
     # `claude -p --resume`. mirror.sh inside that subprocess sees the
-    # marker and skips: posting Bear (would duplicate the user's
+    # marker and skips: posting the mirrored user (would duplicate the
     # original Slack message) and archiving on SessionEnd (resume's
     # SessionEnd is not a real exit). Env var was tried first but CC
     # strips env when spawning hooks — file marker survives.
@@ -653,7 +653,7 @@ case "$ROLE" in
     if [[ -f "$FROM_SLACK_MARKER" ]] || [[ "${CC_BRIDGE_FROM_SLACK:-0}" = "1" ]]; then
       log "skip user mirror (from-slack inject) sid=$SID8"
     else
-      if post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL"; then
+      if post_to_channel "$CHANNEL_ID" "$CONTENT" "$USER_DISPLAY_NAME" "$USER_ICON_URL"; then
         log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
         # Mark this prompt as in-progress with :hourglass:. The Stop hook
         # below will swap it to :white_check_mark: when CC's reply lands.
@@ -774,7 +774,7 @@ case "$ROLE" in
 
   question)
     # PreToolUse for AskUserQuestion: cc is waiting for human input. Mirror
-    # the question(s) + options to channel as Claude Code so Bear knows
+    # the question(s) + options to channel as Claude Code so the user knows
     # to come back to his desk. We don't try to answer from Slack — for
     # that we'd need to inject into the running CC session, which has no
     # public API yet.
@@ -802,7 +802,7 @@ case "$ROLE" in
 
   answer)
     # PostToolUse for AskUserQuestion: human answered. Mirror the chosen
-    # labels back so the channel reflects what Bear picked.
+    # labels back so the channel reflects what the user picked.
     [[ "$(jq -r '.tool_name // empty' <<<"$PAYLOAD")" = "AskUserQuestion" ]] || exit 0
     [[ -f "$STATE_FILE" ]] || exit 0
     CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
@@ -815,7 +815,7 @@ case "$ROLE" in
     ' <<<"$PAYLOAD" 2>/dev/null)"
     [[ -z "$ATEXT" ]] && exit 0
     ATEXT=":white_check_mark: *Answered*"$'\n'"$ATEXT"
-    post_to_channel "$CHANNEL_ID" "$ATEXT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
+    post_to_channel "$CHANNEL_ID" "$ATEXT" "$USER_DISPLAY_NAME" "$USER_ICON_URL" \
       && log "ok role=answer channel=$CHANNEL_ID sid=$SID8"
     ;;
 

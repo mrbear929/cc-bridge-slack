@@ -171,7 +171,7 @@ def inject_lock_for(sid: str) -> threading.Lock:
 
 
 def is_enabled() -> bool:
-    """Default ON — only off if Bear has explicitly stopped via DM."""
+    """Default ON — only off if the user has explicitly stopped via DM."""
     return not (STATE_DIR / "disabled").exists()
 
 
@@ -305,7 +305,7 @@ def channel_to_session(channel_id: str) -> dict[str, Any] | None:
     If the state file says archived but Slack-side the channel was just
     unarchived (e.g. user manually clicked unarchive), trust the Slack
     side: clear the archived flag in state and return the dict. This
-    handles the case where Bear unarchives an old session channel and
+    handles the case where the user unarchives an old session channel and
     expects to be able to inject prompts via Slack.
     """
     for f in STATE_DIR.glob("*.json"):
@@ -343,7 +343,7 @@ def on_message(event: dict[str, Any], client, say) -> None:
     if subtype in ("message_changed", "message_deleted", "channel_join", "channel_topic"):
         return
     # bot_message subtype = ANY bot's post; we also need to skip our own
-    # username-overridden posts (mirror.sh's Bear/Claude Code), which arrive
+    # username-overridden posts (mirror.sh user/Claude Code overrides), which arrive
     # as bot_message + bot_id matching our own bot
     if subtype == "bot_message":
         return
@@ -361,8 +361,8 @@ def on_message(event: dict[str, Any], client, say) -> None:
 
     # Hard-gate by user id. Without this, anyone the bot is added to a
     # shared channel with could drive `claude -p --resume bypassPermissions`
-    # — full FS/network execution on Bear's mac. The sandbox workspace
-    # is single-user (Bear is admin), so any non-Bear user_id reaching
+    # — full FS/network execution on the host machine. The sandbox workspace
+    # is single-user (you are admin), so any non-self user_id reaching
     # us means a misconfigured invite. Refuse loudly.
     if ALLOWED_USER_ID and user and user != ALLOWED_USER_ID:
         log.warning("rejected non-allowed user=%s channel=%s", user, channel_id)
