@@ -485,8 +485,12 @@ PY
   return 0
 }
 
+# Posts a message and exports POSTED_TS (caller can read after this returns).
+# Empty POSTED_TS means the post failed.
+POSTED_TS=""
 post_to_channel() {
   local channel="$1" text="$2" username="$3" icon_url="$4"
+  POSTED_TS=""
   local body
   body="$(jq -nc \
     --arg ch "$channel" \
@@ -498,6 +502,7 @@ post_to_channel() {
   resp="$(slack_api chat.postMessage "$body")"
   ok="$(jq -r '.ok' <<<"$resp" 2>/dev/null)"
   if [[ "$ok" = "true" ]]; then
+    POSTED_TS="$(jq -r '.ts // empty' <<<"$resp" 2>/dev/null)"
     return 0
   fi
 
@@ -522,12 +527,30 @@ post_to_channel() {
     resp="$(slack_api chat.postMessage "$body")"
     ok="$(jq -r '.ok' <<<"$resp" 2>/dev/null)"
     if [[ "$ok" = "true" ]]; then
+      POSTED_TS="$(jq -r '.ts // empty' <<<"$resp" 2>/dev/null)"
       return 0
     fi
   fi
 
   log "ERROR chat.postMessage role=$ROLE: $resp"
   return 1
+}
+
+# Add a reaction to a message. Best-effort, errors swallowed.
+add_reaction() {
+  local channel="$1" ts="$2" name="$3"
+  [[ -z "$ts" ]] && return 0
+  slack_api reactions.add \
+    "$(jq -nc --arg ch "$channel" --arg ts "$ts" --arg n "$name" \
+       '{channel:$ch, timestamp:$ts, name:$n}')" >/dev/null 2>&1 || true
+}
+
+remove_reaction() {
+  local channel="$1" ts="$2" name="$3"
+  [[ -z "$ts" ]] && return 0
+  slack_api reactions.remove \
+    "$(jq -nc --arg ch "$channel" --arg ts "$ts" --arg n "$name" \
+       '{channel:$ch, timestamp:$ts, name:$n}')" >/dev/null 2>&1 || true
 }
 
 rename_channel() {
@@ -630,8 +653,17 @@ case "$ROLE" in
     if [[ -f "$FROM_SLACK_MARKER" ]] || [[ "${CC_BRIDGE_FROM_SLACK:-0}" = "1" ]]; then
       log "skip user mirror (from-slack inject) sid=$SID8"
     else
-      post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL" \
-        && log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
+      if post_to_channel "$CHANNEL_ID" "$CONTENT" "$BEAR_DISPLAY_NAME" "$BEAR_ICON_URL"; then
+        log "ok role=user channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
+        # Mark this prompt as in-progress with :hourglass:. The Stop hook
+        # below will swap it to :white_check_mark: when CC's reply lands.
+        # Mirrors the daemon's reply-routing UX: phone-side viewer can
+        # tell at a glance whether CC is currently chewing on a turn.
+        if [[ -n "$POSTED_TS" ]]; then
+          add_reaction "$CHANNEL_ID" "$POSTED_TS" "hourglass_flowing_sand"
+          safe_state_update "$SID" --arg ts "$POSTED_TS" '. + {pending_user_ts:$ts}'
+        fi
+      fi
     fi
 
     # Background image upload: Claudian buffers the transcript and flushes
@@ -688,6 +720,17 @@ case "$ROLE" in
 
     post_to_channel "$CHANNEL_ID" "$CONTENT" "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" \
       && log "ok role=assistant channel=$CHANNEL_ID sid=$SID8 bytes=${#CONTENT}"
+
+    # Swap any pending :hourglass: on the most recent user prompt to
+    # :white_check_mark: now that CC has finished this turn. Daemon-driven
+    # injects already manage their own reactions on the user's Slack-side
+    # message; this branch handles the local-CC case.
+    PENDING_TS="$(jq -r '.pending_user_ts // empty' "$STATE_FILE" 2>/dev/null)"
+    if [[ -n "$PENDING_TS" ]]; then
+      remove_reaction "$CHANNEL_ID" "$PENDING_TS" "hourglass_flowing_sand"
+      add_reaction    "$CHANNEL_ID" "$PENDING_TS" "white_check_mark"
+      safe_state_update "$SID" 'del(.pending_user_ts)'
+    fi
 
     # Mark session idle so daemon can drain any queued Slack messages.
     if [[ -f "$STATE_FILE" ]]; then
