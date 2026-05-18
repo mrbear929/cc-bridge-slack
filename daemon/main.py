@@ -305,14 +305,15 @@ def on_message(event: dict[str, Any], client, say) -> None:
 
     sid = state["session_id"]
 
-    # ── Slash commands inside a session channel ──────────────────────────
-    # /exit (or /end, /archive) — close out this session: archive channel,
-    # mark state archived. Doesn't kill the running CC process (we can't
-    # safely; could be mid-tool-use). Matches mirror.sh's archive_channel
-    # logic so SessionEnd → archive remains consistent.
+    # ── In-channel exit command ─────────────────────────────────────────
+    # Plain words: exit / end / archive. Can't use leading slash —
+    # Slack intercepts slash commands client-side and they never reach
+    # our message events. Doesn't kill the running CC process (we can't
+    # safely; could be mid tool use). Matches mirror.sh's archive_channel
+    # logic so SessionEnd-driven archive stays consistent.
     cmd = text.strip().lower()
-    if cmd in ("/exit", "/end", "/archive"):
-        log.info("slash exit channel=%s sid=%s", channel_id, sid[:8])
+    if cmd in ("exit", "end", "archive"):
+        log.info("channel-exit channel=%s sid=%s", channel_id, sid[:8])
         # Mark state archived (mirror.sh end case writes the same fields).
         state_file = STATE_DIR / f"{sid}.json"
         if state_file.exists():
@@ -320,7 +321,7 @@ def on_message(event: dict[str, Any], client, say) -> None:
                 d = json.loads(state_file.read_text())
                 d["archived"] = True
                 d["archived_at"] = datetime.utcnow().isoformat() + "Z"
-                d["archived_by"] = "slack-slash-exit"
+                d["archived_by"] = "slack-channel-exit"
                 state_file.write_text(json.dumps(d, indent=2))
             except Exception as e:
                 log.warning("state write failed: %s", e)
@@ -329,7 +330,7 @@ def on_message(event: dict[str, Any], client, say) -> None:
         try:
             client.chat_postMessage(
                 channel=channel_id,
-                text="_session ended (slash exit from Slack)_",
+                text="_session ended (exit from Slack)_",
                 username="Claude Code",
                 mrkdwn=True,
             )
