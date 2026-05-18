@@ -178,7 +178,20 @@ ensure_channel() {
   local state_file="$STATE_DIR/$sid.json"
 
   if [[ -f "$state_file" ]]; then
-    jq -r '.channel_id // empty' "$state_file" 2>/dev/null
+    local existing_ch
+    existing_ch="$(jq -r '.channel_id // empty' "$state_file" 2>/dev/null)"
+    # If user is reopening an old session, the channel may have been
+    # archived when the previous SessionEnd fired. Unarchive it now so
+    # the upcoming post lands. Also clear the archived flag in state.
+    if [[ "$(jq -r '.archived // false' "$state_file" 2>/dev/null)" = "true" ]]; then
+      log "reopened session sid=${sid:0:8} — unarchiving channel $existing_ch"
+      slack_api conversations.unarchive \
+        "$(jq -nc --arg ch "$existing_ch" '{channel:$ch}')" >/dev/null
+      local TMP
+      TMP="$(mktemp)"
+      jq 'del(.archived) | del(.archived_at) | del(.archived_by)' "$state_file" >"$TMP" && mv "$TMP" "$state_file"
+    fi
+    printf '%s' "$existing_ch"
     return
   fi
 
@@ -445,14 +458,40 @@ post_to_channel() {
     --arg u "$username" \
     --arg i "$icon_url" \
     '{channel:$ch, text:$t, mrkdwn:true, username:$u} + (if $i != "" then {icon_url:$i} else {} end)')"
-  local resp ok
+  local resp ok err
   resp="$(slack_api chat.postMessage "$body")"
   ok="$(jq -r '.ok' <<<"$resp" 2>/dev/null)"
-  if [[ "$ok" != "true" ]]; then
-    log "ERROR chat.postMessage role=$ROLE: $resp"
-    return 1
+  if [[ "$ok" = "true" ]]; then
+    return 0
   fi
-  return 0
+
+  err="$(jq -r '.error // ""' <<<"$resp")"
+  # Auto-recover from accidental archive (e.g. SessionEnd fired prematurely
+  # for a session that's actually still alive — Claudian's lifecycle is
+  # not always a clean end-of-life). Unarchive + retry once. Also clear
+  # archived flag in state so daemon's `active` query reflects reality.
+  if [[ "$err" = "is_archived" ]]; then
+    log "channel $channel was archived — unarchiving and retrying"
+    slack_api conversations.unarchive \
+      "$(jq -nc --arg ch "$channel" '{channel:$ch}')" >/dev/null
+    # Clear archived flag from any state file pointing at this channel
+    for sf in "$STATE_DIR"/*.json; do
+      [[ -f "$sf" ]] || continue
+      if [[ "$(jq -r '.channel_id // empty' "$sf")" = "$channel" ]]; then
+        TMP="$(mktemp)"
+        jq 'del(.archived) | del(.archived_at)' "$sf" >"$TMP" && mv "$TMP" "$sf"
+      fi
+    done
+    # Retry the post
+    resp="$(slack_api chat.postMessage "$body")"
+    ok="$(jq -r '.ok' <<<"$resp" 2>/dev/null)"
+    if [[ "$ok" = "true" ]]; then
+      return 0
+    fi
+  fi
+
+  log "ERROR chat.postMessage role=$ROLE: $resp"
+  return 1
 }
 
 rename_channel() {
@@ -602,14 +641,19 @@ case "$ROLE" in
       log "skip end (no state — sub-session) sid=$SID8"
       exit 0
     fi
+
+    # Phase 1.5 behavior: when SessionEnd fires for a session we have a
+    # state file for, archive its channel. This is the original approach
+    # that worked reliably — Claudian's "close conversation" + terminal
+    # /exit both trigger SessionEnd cleanly. Sub-sessions don't have
+    # state files (their user prompt was filtered as cc-internal noise),
+    # so the no-state guard above already protects against false archives.
     CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
     if [[ -n "$CHANNEL_ID" ]]; then
-      # Post a final marker, then archive
       post_to_channel "$CHANNEL_ID" "_session ended ($CONTENT)_" \
         "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
       archive_channel "$CHANNEL_ID"
     fi
-    # Mark state archived so daemon's `active` query excludes this session
     TMP="$(mktemp)"
     jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
        '. + {archived: true, archived_at: $ts}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
