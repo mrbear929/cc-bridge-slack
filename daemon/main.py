@@ -490,15 +490,25 @@ def on_message(event: dict[str, Any], client, say) -> None:
 
             cwd = state.get("cwd") or os.path.expanduser("~")
             if not os.path.isdir(cwd):
-                # Fail loud rather than silently spawning in $HOME with
-                # the wrong transcript dir.
-                log.error("cwd missing for sid=%s — refusing to inject", sid[:8])
-                try:
-                    client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
-                    client.reactions_add(channel=channel_id, name="x", timestamp=event_ts)
-                except Exception:
-                    pass
-                return
+                # cwd was deleted/moved since session creation. Fall back to
+                # the transcript file's parent's vault root by walking up
+                # from transcript_path. This keeps `claude -p --resume`
+                # able to find the project's transcript dir even after a
+                # repo reorg.
+                tp = state.get("transcript_path", "")
+                fallback = os.path.expanduser("~/Documents/obsidian-vault")
+                if os.path.isdir(fallback):
+                    log.warning("cwd %s missing for sid=%s — falling back to %s",
+                                cwd, sid[:8], fallback)
+                    cwd = fallback
+                else:
+                    log.error("cwd missing and no fallback for sid=%s", sid[:8])
+                    try:
+                        client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
+                        client.reactions_add(channel=channel_id, name="x", timestamp=event_ts)
+                    except Exception:
+                        pass
+                    return
 
             # File-based marker survives CC's env stripping when it spawns
             # hooks. mirror.sh checks for $STATE_DIR/from-slack/<sid> and
