@@ -170,6 +170,46 @@ def inject_lock_for(sid: str) -> threading.Lock:
         return _inject_locks[sid]
 
 
+def sid_has_live_process(sid: str) -> bool:
+    """Return True if a *foreign* CC process (terminal / Claudian) is
+    currently running for this sid. We don't want to spawn our own
+    `claude -p --resume` while the local user's session is still alive
+    — it would race them on transcript writes.
+
+    Skips processes in the daemon's own process group (those are our
+    cc-resume children). Skips `-p --resume` invocations specifically
+    to avoid counting our own already-spawned drain workers when a
+    second message arrives.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,pgid=,command="],
+            capture_output=True, text=True, check=True, timeout=2,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    own_pgid = os.getpgid(0)
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            pid_n = int(parts[0]); pgid_n = int(parts[1])
+        except ValueError:
+            continue
+        cmd = parts[2]
+        if "claude" not in cmd or sid not in cmd:
+            continue
+        # Skip our own children (same process group as the daemon)
+        if pgid_n == own_pgid:
+            continue
+        # Belt-and-suspenders: skip cc-resume invocations regardless of pgid
+        if " -p " in cmd and "--resume" in cmd:
+            continue
+        return True
+    return False
+
+
 def is_enabled() -> bool:
     """Default ON — only off if the user has explicitly stopped via DM."""
     return not (STATE_DIR / "disabled").exists()
@@ -291,8 +331,8 @@ def queue_drain_loop() -> None:
                         state = json.loads(state_file.read_text())
                     except json.JSONDecodeError:
                         continue
-                    if state.get("busy"):
-                        continue  # still mid-turn
+                    if state.get("busy") or sid_has_live_process(sid):
+                        continue  # still mid-turn (busy flag OR ps shows live CC)
                     drain_queue_for_sid(sid)
         except Exception as e:
             log.error("queue drain loop crashed: %s", e)
@@ -480,7 +520,7 @@ def on_message(event: dict[str, Any], client, say) -> None:
     # If the session is currently busy (a turn is mid-flight from terminal/
     # Claudian or a previous queued resume), queue and let the drain loop
     # pick it up after Stop fires. Reaction stays as :hourglass: until done.
-    if state.get("busy"):
+    if state.get("busy") or sid_has_live_process(sid):
         enqueue(sid, text, channel_id, event_ts)
         return
 
