@@ -395,12 +395,26 @@ def on_message(event: dict[str, Any], client, say) -> None:
             ]
             say("Active sessions:\n" + "\n".join(lines))
             return
+        if cmd in ("recent", "archived"):
+            recents = list_recently_archived(limit=10)
+            if not recents:
+                say("No recently-archived sessions.")
+                return
+            lines = []
+            for s in recents:
+                title = s.get("title") or s.get("channel_name") or s.get("session_id", "")[:8]
+                age = _humanize_age(s.get("archived_at", ""))
+                lines.append(f"• <#{s['channel_id']}|{s.get('channel_name','?')}> — {title} ({age})")
+            say("Recently archived:\n" + "\n".join(lines) +
+                "\n_Click a channel to unarchive and reply._")
+            return
 
         say(
             "Commands:\n"
             "• `start` / `stop` — toggle mirroring of new CC sessions\n"
             "• `status` — am I on?\n"
             "• `active` — list running sessions\n"
+            "• `recent` — list recently-archived sessions\n"
             "_To reply to a session, message in its channel directly._"
         )
         return
@@ -578,14 +592,122 @@ def list_active_sessions() -> list[dict[str, Any]]:
     return out
 
 
+def list_recently_archived(limit: int = 10) -> list[dict[str, Any]]:
+    """State files marked archived but Slack channel still alive (not yet
+    swept). Sorted newest-first. Excludes truly-Slack-archived ones (the
+    sweeper sets a `slack_archived` flag once it actually archives)."""
+    archived: list[dict[str, Any]] = []
+    for f in STATE_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except json.JSONDecodeError:
+            continue
+        if not d.get("archived"):
+            continue
+        if d.get("slack_archived"):
+            continue  # already removed from Slack sidebar
+        archived.append(d)
+    archived.sort(key=lambda d: d.get("archived_at", ""), reverse=True)
+    return archived[:limit]
+
+
+def _humanize_age(iso: str) -> str:
+    """'2h ago' / '3d ago' from an ISO timestamp."""
+    if not iso:
+        return ""
+    try:
+        ts = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    delta = datetime.now(timezone.utc) - ts
+    secs = int(delta.total_seconds())
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    return f"{secs // 86400}d ago"
+
+
+def archive_sweeper(grace_days: int = 7) -> None:
+    """Hourly: walk state files, find sessions where archived_at is
+    older than `grace_days`, and actually archive the Slack channel +
+    set `slack_archived` flag. Until then channels stay visible in the
+    sidebar so the user can find / reopen them."""
+    while True:
+        try:
+            cutoff = datetime.now(timezone.utc).timestamp() - grace_days * 86400
+            for f in STATE_DIR.glob("*.json"):
+                try:
+                    d = json.loads(f.read_text())
+                except json.JSONDecodeError:
+                    continue
+                if not d.get("archived") or d.get("slack_archived"):
+                    continue
+                iso = d.get("archived_at", "")
+                if not iso:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+                except ValueError:
+                    continue
+                if ts > cutoff:
+                    continue  # still within grace
+                ch = d.get("channel_id")
+                if not ch:
+                    continue
+                try:
+                    app.client.conversations_archive(channel=ch)
+                    log.info("swept (archived) sid=%s channel=%s age=%dd",
+                             d.get("session_id", "")[:8], ch,
+                             int((datetime.now(timezone.utc).timestamp() - ts) // 86400))
+                except Exception as e:
+                    msg = str(e)
+                    if "already_archived" in msg:
+                        pass  # fine, fall through to mark it
+                    else:
+                        log.warning("sweeper archive failed channel=%s: %s", ch, e)
+                        continue
+                sid = d.get("session_id", "")
+                state_update(sid, lambda s: {**s, "slack_archived": True})
+        except Exception as e:
+            log.error("archive sweeper iteration crashed: %s", e)
+        time.sleep(3600)
+
+
 def main() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.chmod(0o700)
+
+    # Clear orphan from-slack markers from a previous daemon crash. If
+    # there were any cc-resume subprocesses still running when the
+    # previous daemon died, they're either dead too (subprocess.run is
+    # synchronous; killing the daemon kills them) or finished without
+    # the daemon's finally-block running. Either way the marker is
+    # stale — leaving it tells mirror.sh to skip mirroring forever.
+    marker_dir = STATE_DIR / "from-slack"
+    if marker_dir.exists():
+        cleared = 0
+        for m in marker_dir.iterdir():
+            try:
+                m.unlink()
+                cleared += 1
+            except OSError:
+                pass
+        if cleared:
+            log.info("cleared %d orphan from-slack marker(s)", cleared)
+
     log.info("starting cc-bridge daemon (state=%s)", STATE_DIR)
 
     # Queue drain loop: dispatch queued Slack messages whenever the
     # destination session goes idle (busy=false flipped by Stop hook).
     threading.Thread(target=queue_drain_loop, daemon=True).start()
+
+    # Archive sweeper: hourly, archive Slack channels for sessions that
+    # have been state-archived for > 7 days. Keeps recent channels in
+    # the sidebar; cleans out stale ones over time.
+    threading.Thread(target=archive_sweeper, daemon=True).start()
 
     handler = SocketModeHandler(app, get_app_token())
     handler.start()
