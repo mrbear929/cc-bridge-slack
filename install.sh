@@ -98,6 +98,63 @@ chmod 700 "$STATE_DIR"
 green "✓ $STATE_DIR (mode 700)"
 echo
 
+# ----- 4b. App-level token (for daemon Socket Mode) -------------------------
+cyan "==> Slack app-level token (xapp-)"
+APP_TOKEN_FILE="$HOME/.claude/tools/slack-bridge-app.token"
+if [[ -f "$APP_TOKEN_FILE" ]]; then
+  green "✓ $APP_TOKEN_FILE already exists"
+  read -rp "Overwrite with a new token? [y/N] " yn
+  if [[ "$yn" =~ ^[Yy]$ ]]; then
+    read -rsp "Paste app-level token (xapp-...): " app_token; echo
+    printf '%s' "$app_token" >"$APP_TOKEN_FILE"
+    chmod 600 "$APP_TOKEN_FILE"
+    green "✓ replaced"
+  fi
+else
+  read -rsp "Paste app-level token (xapp-...): " app_token; echo
+  if [[ -n "$app_token" ]]; then
+    printf '%s' "$app_token" >"$APP_TOKEN_FILE"
+    chmod 600 "$APP_TOKEN_FILE"
+    green "✓ wrote $APP_TOKEN_FILE (mode 600)"
+  else
+    gray "  skipped (daemon won't start without this — re-run installer to add)"
+  fi
+fi
+echo
+
+# ----- 4c. Daemon venv + launchd --------------------------------------------
+cyan "==> daemon installation"
+if command -v uv >/dev/null 2>&1; then
+  if "$REPO_DIR/daemon/sync-to-launchd.sh" 2>&1 | tail -2; then
+    green "✓ daemon synced to ~/Library/Application Support/cc-bridge-daemon/"
+  else
+    red "✗ sync-to-launchd.sh failed; daemon will not be available"
+  fi
+
+  PLIST_SRC="$REPO_DIR/daemon/launchd/com.bear.cc-bridge.plist"
+  PLIST_DEST="$HOME/Library/LaunchAgents/com.bear.cc-bridge.plist"
+  if [[ -f "$PLIST_DEST" ]]; then
+    green "✓ launchd plist already installed at $PLIST_DEST"
+    gray "  (overwriting with current source for any path/PATH updates)"
+    cp "$PLIST_SRC" "$PLIST_DEST"
+    launchctl bootout "gui/$(id -u)/com.bear.cc-bridge" 2>/dev/null || true
+  else
+    cp "$PLIST_SRC" "$PLIST_DEST"
+    green "✓ copied plist to LaunchAgents"
+  fi
+
+  if launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST" 2>/dev/null; then
+    launchctl enable "gui/$(id -u)/com.bear.cc-bridge" 2>/dev/null || true
+    green "✓ launchd service bootstrapped"
+  else
+    red "✗ launchctl bootstrap failed (already loaded? try kickstart -k)"
+  fi
+else
+  red "✗ uv not found — install via 'brew install uv', then re-run this installer"
+  gray "  daemon won't be available until then; mirror.sh side still works"
+fi
+echo
+
 # ----- 5. Hook block instructions --------------------------------------------
 cyan "==> Claude Code hook configuration"
 SETTINGS="$HOME/.claude/settings.json"

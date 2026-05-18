@@ -66,6 +66,53 @@ fi
 export SLACK_BOT_TOKEN
 
 mkdir -p "$STATE_DIR" 2>/dev/null
+chmod 700 "$STATE_DIR" 2>/dev/null
+
+# Per-sid mutex helpers. macOS lacks `flock`, so we use `mkdir` which is
+# atomic on POSIX filesystems. The lock dir is removed in a trap.
+state_lock() {
+  local sid="$1" tries=0
+  local lockdir="$STATE_DIR/.lock-$sid"
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    tries=$((tries + 1))
+    # Stale lock cleanup: lock older than 10s gets blown away.
+    if [[ -d "$lockdir" ]]; then
+      local age
+      age=$(( $(date +%s) - $(stat -f %m "$lockdir" 2>/dev/null || echo 0) ))
+      if (( age > 10 )); then
+        rm -rf "$lockdir" 2>/dev/null
+        continue
+      fi
+    fi
+    (( tries > 50 )) && return 1   # ~5s give-up
+    sleep 0.1
+  done
+  return 0
+}
+state_unlock() {
+  rm -rf "$STATE_DIR/.lock-$1" 2>/dev/null
+}
+
+# safe_state_update <sid> <jq-filter-args...>
+# Atomically reads STATE_FILE, applies jq filter, writes back. Uses
+# mkdir-mutex to coordinate with the daemon and other concurrent
+# mirror.sh invocations for the same sid.
+safe_state_update() {
+  local sid="$1"; shift
+  local f="$STATE_DIR/$sid.json"
+  [[ -f "$f" ]] || return 1
+  if ! state_lock "$sid"; then
+    log "WARN could not acquire state lock sid=${sid:0:8} — skipping update"
+    return 1
+  fi
+  local tmp; tmp="$(mktemp)"
+  if jq "$@" "$f" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
+  state_unlock "$sid"
+}
 
 # Daemon-controlled kill switch: presence of 'disabled' flag = paused.
 # Only blocks NEW sessions from being created. Already-active sessions
@@ -151,16 +198,6 @@ is_user_noise() {
   return 1
 }
 
-# CC's own internal title-gen Stop (short, no-newline reply right after a
-# real Stop) — we ignore these entirely now that we generate titles
-# ourselves via Bedrock.
-is_cc_internal_title() {
-  local text="$1"
-  local len=${#text}
-  (( len > 0 && len < 60 )) && [[ "$text" != *$'\n'* ]] && return 0
-  return 1
-}
-
 CONTENT="$(extract "$ROLE" "$PAYLOAD")"
 
 # --- Slack API helpers ------------------------------------------------------
@@ -187,9 +224,7 @@ ensure_channel() {
       log "reopened session sid=${sid:0:8} — unarchiving channel $existing_ch"
       slack_api conversations.unarchive \
         "$(jq -nc --arg ch "$existing_ch" '{channel:$ch}')" >/dev/null
-      local TMP
-      TMP="$(mktemp)"
-      jq 'del(.archived) | del(.archived_at) | del(.archived_by)' "$state_file" >"$TMP" && mv "$TMP" "$state_file"
+      safe_state_update "$sid" 'del(.archived) | del(.archived_at) | del(.archived_by)'
     fi
     printf '%s' "$existing_ch"
     return
@@ -579,8 +614,7 @@ case "$ROLE" in
     # Mark session busy: daemon uses this to queue inbound Slack messages
     # rather than racing the live cc process. Cleared on Stop.
     if [[ -f "$STATE_FILE" ]]; then
-      TMP="$(mktemp)"
-      jq '. + {busy: true}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+      safe_state_update "$SID" '. + {busy: true}'
     fi
 
     # When daemon's reply-routing spawned this turn, the user's prompt is
@@ -614,8 +648,7 @@ case "$ROLE" in
     if [[ -f "$STATE_FILE" ]]; then
       HAS_FIRST="$(jq -r 'has("first_prompt")' "$STATE_FILE" 2>/dev/null)"
       if [[ "$HAS_FIRST" != "true" ]]; then
-        TMP="$(mktemp)"
-        jq --arg p "$CONTENT" '. + {first_prompt:$p}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+        safe_state_update "$SID" --arg p "$CONTENT" '. + {first_prompt:$p}'
       fi
     fi
     ;;
@@ -644,8 +677,7 @@ case "$ROLE" in
       RENAMED="$(jq -r '.renamed // false' "$STATE_FILE")"
       HAS_FIRST_REPLY="$(jq -r 'has("first_reply")' "$STATE_FILE")"
       if [[ "$RENAMED" != "true" && "$HAS_FIRST_REPLY" != "true" ]]; then
-        TMP="$(mktemp)"
-        jq --arg r "$CONTENT" '. + {first_reply:$r}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+        safe_state_update "$SID" --arg r "$CONTENT" '. + {first_reply:$r}'
         TITLE_GEN="$(dirname "$0")/title-generator.sh"
         if [[ -x "$TITLE_GEN" ]]; then
           ( "$TITLE_GEN" "$SID" >/dev/null 2>&1 & disown ) 2>/dev/null
@@ -659,8 +691,7 @@ case "$ROLE" in
 
     # Mark session idle so daemon can drain any queued Slack messages.
     if [[ -f "$STATE_FILE" ]]; then
-      TMP="$(mktemp)"
-      jq '. + {busy: false}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+      safe_state_update "$SID" '. + {busy: false}'
     fi
     ;;
 
@@ -694,9 +725,8 @@ case "$ROLE" in
         "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
       archive_channel "$CHANNEL_ID"
     fi
-    TMP="$(mktemp)"
-    jq --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-       '. + {archived: true, archived_at: $ts}' "$STATE_FILE" >"$TMP" && mv "$TMP" "$STATE_FILE"
+    safe_state_update "$SID" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       '. + {archived: true, archived_at: $ts, archived_by: "session-end"}'
     ;;
 
   question)

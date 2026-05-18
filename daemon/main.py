@@ -34,7 +34,9 @@ import pathlib
 import subprocess
 import sys
 import threading
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import fcntl
 from typing import Any
 
 from slack_bolt import App
@@ -42,9 +44,28 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 STATE_DIR = pathlib.Path(os.path.expanduser("~/.claude/tools/cc-bridge-state"))
 LOG_FILE = pathlib.Path("/tmp/cc-bridge-daemon.log")
+ENV_FILE = pathlib.Path(os.path.expanduser("~/.claude/tools/slack-bridge.env"))
 
 KEYCHAIN_SERVICE = "cc-bridge-slack"
 KEYCHAIN_BOT_ACCOUNT = "bot-token"
+
+
+def load_env_file() -> dict[str, str]:
+    """Load shell-style env file (KEY=value) into a plain dict."""
+    out: dict[str, str] = {}
+    if not ENV_FILE.exists():
+        return out
+    for line in ENV_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+CONFIG = load_env_file()
+ALLOWED_USER_ID = CONFIG.get("SLACK_USER_ID", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,6 +98,76 @@ def get_app_token() -> str:
         )
         sys.exit(1)
     return token
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Per-sid state-file locking.
+# mirror.sh uses mkdir on $STATE_DIR/.lock-$sid as its mutex; we use the
+# same dir so the two coordinate. fcntl.flock is per-fd which doesn't
+# help across processes the same way, so we mirror mirror.sh's scheme.
+# ──────────────────────────────────────────────────────────────────────
+
+
+@contextmanager
+def state_lock(sid: str, timeout_s: float = 5.0):
+    lockdir = STATE_DIR / f".lock-{sid}"
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            lockdir.mkdir()
+            break
+        except FileExistsError:
+            # Stale-lock cleanup: > 10s old means a previous holder crashed.
+            try:
+                age = time.time() - lockdir.stat().st_mtime
+                if age > 10:
+                    lockdir.rmdir()
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() > deadline:
+                log.warning("state lock timeout sid=%s — proceeding without lock", sid[:8])
+                yield
+                return
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        try:
+            lockdir.rmdir()
+        except FileNotFoundError:
+            pass
+
+
+def state_update(sid: str, mutator) -> dict[str, Any] | None:
+    """Atomically read+mutate+write state file. mutator(dict)->dict."""
+    f = STATE_DIR / f"{sid}.json"
+    if not f.exists():
+        return None
+    with state_lock(sid):
+        try:
+            d = json.loads(f.read_text())
+        except json.JSONDecodeError:
+            return None
+        new = mutator(d)
+        if new is not None:
+            f.write_text(json.dumps(new, indent=2))
+            return new
+        return d
+
+
+# Per-sid concurrency cap on `claude -p --resume` spawns. Without this,
+# a flood of Slack messages could fan out to dozens of subprocesses
+# all clobbering the same transcript file.
+_inject_locks: dict[str, threading.Lock] = {}
+_inject_locks_guard = threading.Lock()
+
+
+def inject_lock_for(sid: str) -> threading.Lock:
+    with _inject_locks_guard:
+        if sid not in _inject_locks:
+            _inject_locks[sid] = threading.Lock()
+        return _inject_locks[sid]
 
 
 def is_enabled() -> bool:
@@ -119,9 +210,16 @@ def drain_queue_for_sid(sid: str) -> None:
     except json.JSONDecodeError:
         return
 
-    # Atomically claim queue contents
-    queued_lines = qfile.read_text().splitlines()
-    qfile.unlink(missing_ok=True)
+    # Atomically claim queue contents — rename then read, so any
+    # concurrent enqueue lands in a fresh file (which the next loop tick
+    # will pick up).
+    claim = qfile.with_suffix(f".jsonl.claim-{os.getpid()}")
+    try:
+        qfile.rename(claim)
+    except FileNotFoundError:
+        return
+    queued_lines = claim.read_text().splitlines()
+    claim.unlink(missing_ok=True)
     if not queued_lines:
         return
 
@@ -223,11 +321,13 @@ def channel_to_session(channel_id: str) -> dict[str, Any] | None:
                 resp = app.client.conversations_info(channel=channel_id)
                 if not resp["channel"].get("is_archived"):
                     log.info("state stale: %s says archived but slack says unarchived — syncing", channel_id)
-                    d.pop("archived", None)
-                    d.pop("archived_at", None)
-                    d.pop("archived_by", None)
-                    f.write_text(json.dumps(d, indent=2))
-                    return d
+                    sid = d.get("session_id", "")
+                    def _clear(s: dict) -> dict:
+                        for k in ("archived", "archived_at", "archived_by"):
+                            s.pop(k, None)
+                        return s
+                    updated = state_update(sid, _clear)
+                    return updated or d
             except Exception as e:
                 log.warning("could not verify channel state: %s", e)
             return None
@@ -258,6 +358,15 @@ def on_message(event: dict[str, Any], client, say) -> None:
     channel_id = event.get("channel")
     user = event.get("user")
     event_ts = event.get("ts")
+
+    # Hard-gate by user id. Without this, anyone the bot is added to a
+    # shared channel with could drive `claude -p --resume bypassPermissions`
+    # — full FS/network execution on Bear's mac. The sandbox workspace
+    # is single-user (Bear is admin), so any non-Bear user_id reaching
+    # us means a misconfigured invite. Refuse loudly.
+    if ALLOWED_USER_ID and user and user != ALLOWED_USER_ID:
+        log.warning("rejected non-allowed user=%s channel=%s", user, channel_id)
+        return
 
     # ── DM commands ───────────────────────────────────────────────────────
     if channel_type == "im":
@@ -315,16 +424,12 @@ def on_message(event: dict[str, Any], client, say) -> None:
     if cmd in ("exit", "end", "archive"):
         log.info("channel-exit channel=%s sid=%s", channel_id, sid[:8])
         # Mark state archived (mirror.sh end case writes the same fields).
-        state_file = STATE_DIR / f"{sid}.json"
-        if state_file.exists():
-            try:
-                d = json.loads(state_file.read_text())
-                d["archived"] = True
-                d["archived_at"] = datetime.utcnow().isoformat() + "Z"
-                d["archived_by"] = "slack-channel-exit"
-                state_file.write_text(json.dumps(d, indent=2))
-            except Exception as e:
-                log.warning("state write failed: %s", e)
+        def _mark_archived(d: dict) -> dict:
+            d["archived"] = True
+            d["archived_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            d["archived_by"] = "slack-channel-exit"
+            return d
+        state_update(sid, _mark_archived)
         # Post a closing marker as Claude Code identity (consistent with
         # the SessionEnd hook's "_session ended (...)_" line) and archive.
         try:
@@ -366,6 +471,13 @@ def on_message(event: dict[str, Any], client, say) -> None:
         return
 
     def runner() -> None:
+        # Per-sid serialization: only one `claude -p --resume <sid>` may
+        # run at a time. Prevents two Slack messages from spawning two
+        # concurrent CCs that would clobber each other's transcript writes.
+        with inject_lock_for(sid):
+            _run_inject(state, sid, channel_id, event_ts, text, client)
+
+    def _run_inject(state, sid, channel_id, event_ts, text, client) -> None:
         try:
             # Build a clean env: drop CLAUDE_CODE_* leakage from the parent
             # process so the subprocess doesn't inherit "I am session X".
@@ -378,7 +490,15 @@ def on_message(event: dict[str, Any], client, say) -> None:
 
             cwd = state.get("cwd") or os.path.expanduser("~")
             if not os.path.isdir(cwd):
-                cwd = os.path.expanduser("~")
+                # Fail loud rather than silently spawning in $HOME with
+                # the wrong transcript dir.
+                log.error("cwd missing for sid=%s — refusing to inject", sid[:8])
+                try:
+                    client.reactions_remove(channel=channel_id, name="hourglass_flowing_sand", timestamp=event_ts)
+                    client.reactions_add(channel=channel_id, name="x", timestamp=event_ts)
+                except Exception:
+                    pass
+                return
 
             # File-based marker survives CC's env stripping when it spawns
             # hooks. mirror.sh checks for $STATE_DIR/from-slack/<sid> and
@@ -448,120 +568,10 @@ def list_active_sessions() -> list[dict[str, Any]]:
     return out
 
 
-def get_alive_session_ids() -> set[str]:
-    """Return CLAUDE_CODE_SESSION_ID values for any running cc process,
-    excluding our own daemon process tree (which inherits the env var
-    from whichever shell launched us)."""
-    try:
-        # ps -E -axww gives "PID TT STAT TIME CMD env=val env=val ..."
-        result = subprocess.run(
-            ["ps", "-E", "-axww", "-o", "pid=,command="],
-            capture_output=True, text=True, check=True,
-        )
-    except subprocess.CalledProcessError:
-        return set()
-
-    own_pid = os.getpid()
-    own_pgid = os.getpgid(0)
-    alive: set[str] = set()
-    for line in result.stdout.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) < 2:
-            continue
-        try:
-            pid = int(parts[0])
-        except ValueError:
-            continue
-        cmd = parts[1]
-
-        # Skip our own process tree (daemon + its children inherit
-        # CLAUDE_CODE_SESSION_ID from the shell that launched us)
-        if pid == own_pid:
-            continue
-        try:
-            if os.getpgid(pid) == own_pgid:
-                continue
-        except (ProcessLookupError, PermissionError):
-            pass
-
-        # Extract session id from env list embedded in cmd
-        for tok in cmd.split():
-            if tok.startswith("CLAUDE_CODE_SESSION_ID="):
-                sid = tok.split("=", 1)[1]
-                if sid:
-                    alive.add(sid)
-                break
-    return alive
-
-
-def archive_channel_via_api(channel_id: str) -> None:
-    try:
-        app.client.conversations_archive(channel=channel_id)
-    except Exception as e:
-        log.warning("archive failed channel=%s: %s", channel_id, e)
-
-
-def sweep_dead_sessions() -> None:
-    """Background sweeper: every 5s, archive channels whose CC process
-    is no longer running. Replaces the SessionEnd hook (unreliable).
-    Uses creation timestamp (not mtime) for grace period to avoid
-    re-arming on every state file write."""
-    import time
-    from datetime import datetime, timezone
-    log.info("sweeper started (5s interval)")
-    while True:
-        try:
-            alive = get_alive_session_ids()
-            now = datetime.now(timezone.utc)
-            now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-            for state_file in STATE_DIR.glob("*.json"):
-                try:
-                    state = json.loads(state_file.read_text())
-                except json.JSONDecodeError:
-                    continue
-                if state.get("archived"):
-                    continue
-                sid = state.get("session_id")
-                if not sid or sid in alive:
-                    continue
-                channel_id = state.get("channel_id")
-                if not channel_id:
-                    continue
-                # Grace period 15s based on .created field (not mtime —
-                # mtime updates whenever we touch state). Protects only
-                # newly-created sessions whose process may not yet appear
-                # in ps output.
-                created_str = state.get("created", "")
-                try:
-                    created = datetime.fromisoformat(
-                        created_str.replace("Z", "+00:00")
-                    )
-                    age = (now - created).total_seconds()
-                except Exception:
-                    age = 999  # unknown → assume old
-                if age < 15:
-                    continue
-                log.info("archiving dead session sid=%s channel=%s age=%ds",
-                         sid[:8], channel_id, int(age))
-                archive_channel_via_api(channel_id)
-                state["archived"] = True
-                state["archived_at"] = now_iso
-                state["archived_by"] = "sweeper"
-                state_file.write_text(json.dumps(state, indent=2))
-        except Exception as e:
-            log.error("sweeper iteration crashed: %s", e)
-        time.sleep(5)
-
-
 def main() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.chmod(0o700)
     log.info("starting cc-bridge daemon (state=%s)", STATE_DIR)
-
-    # Sweeper disabled. Phase 1.5's SessionEnd hook is reliable when we
-    # don't second-guess it (sub-sessions filtered by no-state-file
-    # guard, real exits archive cleanly). Reopening an old session
-    # auto-unarchives via mirror.sh ensure_channel.
-    # threading.Thread(target=sweep_dead_sessions, daemon=True).start()
 
     # Queue drain loop: dispatch queued Slack messages whenever the
     # destination session goes idle (busy=false flipped by Stop hook).
