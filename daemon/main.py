@@ -157,7 +157,7 @@ def drain_queue_for_sid(sid: str) -> None:
         try:
             marker.touch()
             result = subprocess.run(
-                ["claude", "-p", "--resume", sid, "--output-format", "text", text],
+                ["claude", "-p", "--resume", sid, "--permission-mode", "bypassPermissions", "--output-format", "text", text],
                 capture_output=True, text=True, timeout=600, env=child_env, cwd=cwd,
             )
             if result.returncode != 0:
@@ -347,7 +347,7 @@ def on_message(event: dict[str, Any], client, say) -> None:
             marker.touch()
             try:
                 result = subprocess.run(
-                    ["claude", "-p", "--resume", sid, "--output-format", "text", text],
+                    ["claude", "-p", "--resume", sid, "--permission-mode", "bypassPermissions", "--output-format", "text", text],
                     capture_output=True,
                     text=True,
                     timeout=600,
