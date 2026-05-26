@@ -765,6 +765,54 @@ _NEW_USAGE = "usage: `new <prompt>` or `new <path>: <prompt>`"
 _DEFAULT_NEW_CWD = os.path.expanduser("~/Documents/obsidian-vault")
 
 
+def _patch_init_message_surface(channel_id: str, state: dict[str, Any], sid: str) -> None:
+    """Find the cc-bridge-bot's first message in the channel (the init
+    message posted by mirror.sh's ensure_channel), and update its
+    Surface line to `slack-dm`. Best-effort; failures don't break the
+    new-session flow."""
+    try:
+        # Find the oldest non-system message authored by our bot
+        resp = app.client.conversations_history(channel=channel_id, limit=20)
+        msgs = resp.get("messages", []) or []
+        # history returns newest-first; walk in reverse to find oldest first
+        target = None
+        for m in reversed(msgs):
+            if m.get("subtype") in ("channel_join", "channel_purpose",
+                                    "channel_topic", "channel_archive",
+                                    "channel_unarchive", "channel_name"):
+                continue
+            text = m.get("text", "") or ""
+            if "*Session start*" in text or "Session start" in text:
+                target = m
+                break
+        if not target:
+            return
+        ts = target.get("ts")
+        old_text = target.get("text", "")
+        if not ts or not old_text:
+            return
+        # Replace the Surface line. mirror.sh writes the line with escaped
+        # backticks (`\`<value>\``) so Slack renders the value as inline
+        # code. Capture the opening and closing backtick markers literally
+        # and preserve them, replacing only the value in between.
+        import re as _re
+        # Match the leading "• Surface: " then capture the open marker
+        # (either `\`` or `` ` ``), the value (anything that's not a
+        # backtick), and the close marker.
+        new_text = _re.sub(
+            r"(• Surface: )(\\`|`)([^`\\]*)(\\`|`)",
+            lambda m: f"{m.group(1)}{m.group(2)}slack-dm{m.group(4)}",
+            old_text,
+            count=1,
+        )
+        if new_text == old_text:
+            return  # no Surface line found, nothing to do
+        app.client.chat_update(channel=channel_id, ts=ts, text=new_text)
+        log.info("patched init-message surface for sid=%s", sid[:8])
+    except Exception as e:
+        log.warning("init-message surface patch failed sid=%s: %s", sid[:8], e)
+
+
 def handle_new_session(text: str) -> str:
     """Parse a `new [<path>:] <prompt>` DM, spawn a detached `claude -p`
     headless subprocess, watch the state dir for the new sid, return a
@@ -832,6 +880,9 @@ def handle_new_session(text: str) -> str:
     for k in list(child_env.keys()):
         if k.startswith("CLAUDE_CODE_") or k == "CLAUDECODE" or k == "AI_AGENT":
             del child_env[k]
+    # Mark this process tree so detect-surface.sh can identify it as
+    # slack-dm-originated even before the state file is updated.
+    child_env["CC_BRIDGE_SLACK_DM"] = "1"
 
     spawn_time = time.time()
     try:
@@ -882,6 +933,13 @@ def handle_new_session(text: str) -> str:
                 state_update(sid_found, lambda s: {**s,
                                                     "headless_origin": True,
                                                     "surface": "slack-dm"})
+                # Patch the init message in the channel to show the correct
+                # surface. mirror.sh's ensure_channel posted it with whatever
+                # surface detect-surface.sh found at hook-fire time (often
+                # `unknown` or `obsidian-terminal` for daemon-spawned procs
+                # since the daemon isn't in the hook's ancestor chain). Find
+                # the bot's first message in the channel and chat.update it.
+                _patch_init_message_surface(ch, d, sid_found)
             return f"<#{ch}> ready (sid `{sid_found[:8]}`)"
         time.sleep(1)
 
