@@ -297,11 +297,12 @@ the current cwd.
 
 ## Next-time-you-pick-this-up checklist
 
-1. Read `docs/FEATURES.md` for the feature inventory (done vs pending).
+1. Read `docs/PRD.md` for the feature catalog (status, requirements,
+   acceptance tests) and the current cycle's phasing.
 2. Read this DEVLOG for invariants and known sharp edges.
 3. Run `tail -f /tmp/cc-bridge-daemon.log` and
    `tail -f /tmp/cc-mirror-test.log` in two panes.
-4. Pick something from the **Pending** section in FEATURES.md, or
-   investigate one of the sharp edges above.
+4. Pick a 🔧 or 📋 item from PRD §6 or investigate one of the sharp
+   edges above.
 5. Don't change Invariants 1-4 without understanding why they're
    there. Most of the bugs above are violations of those.

@@ -448,6 +448,21 @@ def on_message(event: dict[str, Any], client, say) -> None:
             say("Recently archived:\n" + "\n".join(lines) +
                 "\n_Click a channel to unarchive and reply._")
             return
+        if cmd in ("sweep", "cleanup"):
+            archived, errors = sweep_once(grace_days=0)
+            msg = f"swept {archived} channel(s)"
+            if errors:
+                msg += f" ({errors} error(s) — see daemon log)"
+            say(msg)
+            return
+
+        # `new <path>: <prompt>` — mobile-initiated session.
+        # Match on the original `text` (case-preserved) so paths and prompts
+        # aren't lower-cased.
+        if text.lower().startswith("new"):
+            response = handle_new_session(text)
+            say(response)
+            return
 
         say(
             "Commands:\n"
@@ -455,6 +470,8 @@ def on_message(event: dict[str, Any], client, say) -> None:
             "• `status` — am I on?\n"
             "• `active` — list running sessions\n"
             "• `recent` — list recently-archived sessions\n"
+            "• `sweep` — archive any state-archived sessions whose Slack channel is still open\n"
+            "• `new <path>: <prompt>` — start a fresh CC session headlessly\n"
             "_To reply to a session, message in its channel directly._"
         )
         return
@@ -670,50 +687,155 @@ def _humanize_age(iso: str) -> str:
     return f"{secs // 86400}d ago"
 
 
-def archive_sweeper(grace_days: int = 7) -> None:
-    """Hourly: walk state files, find sessions where archived_at is
-    older than `grace_days`, and actually archive the Slack channel +
-    set `slack_archived` flag. Until then channels stay visible in the
-    sidebar so the user can find / reopen them."""
-    while True:
-        try:
-            cutoff = datetime.now(timezone.utc).timestamp() - grace_days * 86400
-            for f in STATE_DIR.glob("*.json"):
-                try:
-                    d = json.loads(f.read_text())
-                except json.JSONDecodeError:
+def sweep_once(grace_days: int = 0) -> tuple[int, int]:
+    """One-shot sweep: walk state files, find sessions where archived_at
+    is older than `grace_days`, archive the Slack channel, set
+    `slack_archived=true`. Returns `(archived_count, error_count)`.
+
+    Primary archive mechanism is now mirror.sh SessionEnd (Task 2).
+    This is the manual fallback the user invokes via DM `sweep`.
+    grace_days=0 by default: archive everything currently in the
+    state-archived-but-not-slack-archived state."""
+    archived_count = 0
+    error_count = 0
+    try:
+        cutoff = datetime.now(timezone.utc).timestamp() - grace_days * 86400
+        for f in STATE_DIR.glob("*.json"):
+            try:
+                d = json.loads(f.read_text())
+            except json.JSONDecodeError:
+                continue
+            if not d.get("archived") or d.get("slack_archived"):
+                continue
+            iso = d.get("archived_at", "")
+            if not iso:
+                continue
+            try:
+                ts = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if ts > cutoff:
+                continue  # still within grace
+            ch = d.get("channel_id")
+            if not ch:
+                continue
+            try:
+                app.client.conversations_archive(channel=ch)
+                log.info("swept (archived) sid=%s channel=%s age=%dd",
+                         d.get("session_id", "")[:8], ch,
+                         int((datetime.now(timezone.utc).timestamp() - ts) // 86400))
+            except Exception as e:
+                msg = str(e)
+                if "already_archived" in msg:
+                    pass  # fine, fall through to mark it
+                else:
+                    log.warning("sweep archive failed channel=%s: %s", ch, e)
+                    error_count += 1
                     continue
-                if not d.get("archived") or d.get("slack_archived"):
+            sid = d.get("session_id", "")
+            state_update(sid, lambda s: {**s, "slack_archived": True})
+            archived_count += 1
+    except Exception as e:
+        log.error("sweep iteration crashed: %s", e)
+        error_count += 1
+    return archived_count, error_count
+
+
+_NEW_USAGE = "usage: `new <path>: <prompt>`"
+
+
+def handle_new_session(text: str) -> str:
+    """Parse a `new <path>: <prompt>` (or `new <path>\\n<prompt>`) DM,
+    spawn a detached `claude -p` headless subprocess, watch the state
+    dir for the new sid, and return a Slack-formatted response with
+    the channel link. Returns the string the DM handler should `say`.
+
+    Returns synchronously after at most ~30s (success) or 1s (parse
+    error). Subprocess runs detached — daemon does not wait for CC.
+    """
+    body = text.strip()
+    # Strip leading "new" keyword
+    if not body.lower().startswith("new"):
+        return _NEW_USAGE
+    body = body[3:].lstrip()
+    if not body:
+        return _NEW_USAGE
+
+    # Parse two forms: "<path>: <prompt>" OR "<path>\n<prompt>"
+    path = ""
+    prompt = ""
+    if "\n" in body:
+        path_part, _, prompt_part = body.partition("\n")
+        path = path_part.strip().rstrip(":").strip()
+        prompt = prompt_part.strip()
+    elif ":" in body:
+        path_part, _, prompt_part = body.partition(":")
+        path = path_part.strip()
+        prompt = prompt_part.strip()
+    else:
+        return _NEW_USAGE
+
+    if not path or not prompt:
+        return _NEW_USAGE
+
+    # Expand ~ and env vars; resolve symlinks (e.g. /tmp → /private/tmp on
+    # macOS) so the cwd-match in our state-file watcher below uses the same
+    # canonical path CC's hook payload writes into state.
+    path = os.path.realpath(os.path.expandvars(os.path.expanduser(path)))
+    if not pathlib.Path(path).is_dir():
+        return f"path not a directory: `{path}`"
+
+    # Spawn detached. NO from-slack marker — we want mirror.sh to fully
+    # process the user prompt as a normal UserPromptSubmit (creates a
+    # channel, posts the prompt as the user identity, etc.).
+    child_env = os.environ.copy()
+    for k in list(child_env.keys()):
+        if k.startswith("CLAUDE_CODE_") or k == "CLAUDECODE" or k == "AI_AGENT":
+            del child_env[k]
+
+    spawn_time = time.time()
+    try:
+        subprocess.Popen(
+            ["claude", "-p",
+             "--permission-mode", "bypassPermissions",
+             "--output-format", "text",
+             prompt],
+            cwd=path,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=child_env,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return "spawn failed: `claude` CLI not found in PATH"
+    except Exception as e:
+        log.error("new-session spawn failed: %s", e)
+        return f"spawn failed: {e}"
+
+    log.info("new-session spawned: cwd=%s prompt_len=%d", path, len(prompt))
+
+    # Watch state dir for a fresh state file matching cwd, created
+    # after spawn_time. Up to 30s.
+    deadline = spawn_time + 30
+    while time.time() < deadline:
+        for f in STATE_DIR.glob("*.json"):
+            try:
+                if f.stat().st_mtime < spawn_time:
                     continue
-                iso = d.get("archived_at", "")
-                if not iso:
-                    continue
-                try:
-                    ts = datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
-                except ValueError:
-                    continue
-                if ts > cutoff:
-                    continue  # still within grace
-                ch = d.get("channel_id")
-                if not ch:
-                    continue
-                try:
-                    app.client.conversations_archive(channel=ch)
-                    log.info("swept (archived) sid=%s channel=%s age=%dd",
-                             d.get("session_id", "")[:8], ch,
-                             int((datetime.now(timezone.utc).timestamp() - ts) // 86400))
-                except Exception as e:
-                    msg = str(e)
-                    if "already_archived" in msg:
-                        pass  # fine, fall through to mark it
-                    else:
-                        log.warning("sweeper archive failed channel=%s: %s", ch, e)
-                        continue
-                sid = d.get("session_id", "")
-                state_update(sid, lambda s: {**s, "slack_archived": True})
-        except Exception as e:
-            log.error("archive sweeper iteration crashed: %s", e)
-        time.sleep(3600)
+                d = json.loads(f.read_text())
+            except Exception:
+                continue
+            if d.get("cwd") != path:
+                continue
+            ch = d.get("channel_id")
+            if not ch:
+                continue
+            return f"<#{ch}> ready (sid `{d.get('session_id','')[:8]}`)"
+        time.sleep(1)
+
+    return ("spawned, but channel didn't appear within 30s. "
+            "Check `/tmp/cc-mirror-test.log` for hook errors.")
 
 
 def main() -> None:
@@ -744,10 +866,9 @@ def main() -> None:
     # destination session goes idle (busy=false flipped by Stop hook).
     threading.Thread(target=queue_drain_loop, daemon=True).start()
 
-    # Archive sweeper: hourly, archive Slack channels for sessions that
-    # have been state-archived for > 7 days. Keeps recent channels in
-    # the sidebar; cleans out stale ones over time.
-    threading.Thread(target=archive_sweeper, daemon=True).start()
+    # Note: no background archive sweeper. SessionEnd hook archives
+    # immediately (mirror.sh). User invokes manual `sweep` DM command
+    # for any drift catch-up. See sweep_once().
 
     handler = SocketModeHandler(app, get_app_token())
     handler.start()

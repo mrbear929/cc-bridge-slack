@@ -699,21 +699,20 @@ case "$ROLE" in
       exit 0
     fi
 
-    # First reply: kick off title generation as a detached background
-    # job. Used to be synchronous (1-3s before reply landed) — but
-    # Claudian's own title can lag 5-30s, and we want to reuse it
-    # rather than burn a Bedrock call. Detaching lets the reply post
-    # immediately; title-generator.sh patiently waits for Claudian's
-    # meta.json and renames the channel when ready.
+    # Title sync: fire the (cheap, single-pass) title-generator.sh on
+    # every Stop until state.renamed=true. CC writes ai-title to the
+    # transcript jsonl async (terminal CC) and Claudian writes it to
+    # meta.json — sometimes only after the second or third turn. The
+    # generator script is a no-op once renamed.
     if [[ -f "$STATE_FILE" ]]; then
       RENAMED="$(jq -r '.renamed // false' "$STATE_FILE")"
-      HAS_FIRST_REPLY="$(jq -r 'has("first_reply")' "$STATE_FILE")"
-      if [[ "$RENAMED" != "true" && "$HAS_FIRST_REPLY" != "true" ]]; then
+      if [[ ! "$(jq -r 'has("first_reply")' "$STATE_FILE")" = "true" ]]; then
         safe_state_update "$SID" --arg r "$CONTENT" '. + {first_reply:$r}'
+      fi
+      if [[ "$RENAMED" != "true" ]]; then
         TITLE_GEN="$(dirname "$0")/title-generator.sh"
         if [[ -x "$TITLE_GEN" ]]; then
           ( "$TITLE_GEN" "$SID" >/dev/null 2>&1 & disown ) 2>/dev/null
-          log "title-gen queued (background) sid=$SID8"
         fi
       fi
     fi
@@ -730,6 +729,20 @@ case "$ROLE" in
       remove_reaction "$CHANNEL_ID" "$PENDING_TS" "hourglass_flowing_sand"
       add_reaction    "$CHANNEL_ID" "$PENDING_TS" "white_check_mark"
       safe_state_update "$SID" 'del(.pending_user_ts)'
+    fi
+
+    # Deferred-archive consumer: if SessionEnd fired earlier while a user
+    # prompt was hanging (pending_user_ts was set), the end case marked
+    # archive_pending=true and exited without archiving. Now that the
+    # turn has completed and the hourglass has cleared, finish the job.
+    ARCHIVE_PENDING="$(jq -r '.archive_pending // false' "$STATE_FILE" 2>/dev/null)"
+    if [[ "$ARCHIVE_PENDING" = "true" ]]; then
+      post_to_channel "$CHANNEL_ID" "_session ended · archived_" \
+        "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
+      archive_channel "$CHANNEL_ID"
+      safe_state_update "$SID" \
+        '. + {slack_archived: true} | del(.archive_pending)'
+      log "deferred archive completed sid=$SID8"
     fi
 
     # Mark session idle so daemon can drain any queued Slack messages.
@@ -756,23 +769,31 @@ case "$ROLE" in
       exit 0
     fi
 
-    # Phase 1.5 behavior: when SessionEnd fires for a session we have a
-    # state file for, archive its channel. This is the original approach
-    # that worked reliably — Claudian's "close conversation" + terminal
-    # /exit both trigger SessionEnd cleanly. Sub-sessions don't have
-    # state files (their user prompt was filtered as cc-internal noise),
-    # so the no-state guard above already protects against false archives.
+    # Archive immediately on SessionEnd, guarded by pending_user_ts. If a
+    # user prompt is still hanging (⏳ on it, no Stop yet), defer archive:
+    # mark archive_pending=true and exit. The next assistant Stop will
+    # pick it up after clearing the hourglass. This prevents archiving a
+    # channel where the last user message has no answer.
     CHANNEL_ID="$(jq -r '.channel_id // empty' "$STATE_FILE")"
-    if [[ -n "$CHANNEL_ID" ]]; then
-      post_to_channel "$CHANNEL_ID" "_session ended ($CONTENT)_" \
-        "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
-      # NOTE: don't archive the Slack channel here. Channels stay
-      # active in the sidebar for ~7 days so the user can find / reply
-      # to recent sessions without hunting through archived. Daemon's
-      # archive sweeper handles late archive based on archived_at.
+    PENDING_TS="$(jq -r '.pending_user_ts // empty' "$STATE_FILE" 2>/dev/null)"
+    NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    if [[ -n "$PENDING_TS" ]]; then
+      safe_state_update "$SID" --arg ts "$NOW_ISO" \
+        '. + {archived: true, archived_at: $ts, archived_by: "session-end",
+              archive_pending: true}'
+      log "end deferred (pending_user_ts set) sid=$SID8"
+      exit 0
     fi
-    safe_state_update "$SID" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-       '. + {archived: true, archived_at: $ts, archived_by: "session-end"}'
+
+    if [[ -n "$CHANNEL_ID" ]]; then
+      post_to_channel "$CHANNEL_ID" "_session ended · archived_" \
+        "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
+      archive_channel "$CHANNEL_ID"
+    fi
+    safe_state_update "$SID" --arg ts "$NOW_ISO" \
+       '. + {archived: true, archived_at: $ts, archived_by: "session-end",
+             slack_archived: true}'
     ;;
 
   question)

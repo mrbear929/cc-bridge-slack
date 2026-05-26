@@ -6,8 +6,7 @@ back into the running session.
 
 ## Docs
 
+- [Product requirements (PRD)](docs/PRD.md) — features, status, acceptance tests, usage reference
 - [Architecture & design](docs/README.md)
 - [Installation guide](docs/INSTALL.md)
-- [Usage](docs/USAGE.md) — DM commands, channel commands, reactions
 - [Development log](docs/DEVLOG.md) — current architecture, invariants, known sharp edges
-- [Feature inventory](docs/FEATURES.md) — what's done, what's pending, what's intentionally not built
