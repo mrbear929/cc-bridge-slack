@@ -712,16 +712,7 @@ case "$ROLE" in
       if [[ "$RENAMED" != "true" ]]; then
         TITLE_GEN="$(dirname "$0")/title-generator.sh"
         if [[ -x "$TITLE_GEN" ]]; then
-          # Headless-origin sessions (DM `new …`) get archived a few lines
-          # below in this same Stop handler. Run title-gen synchronously
-          # so the rename completes before archive — Slack rejects rename
-          # on an archived channel.
-          HEADLESS="$(jq -r '.headless_origin // false' "$STATE_FILE" 2>/dev/null)"
-          if [[ "$HEADLESS" = "true" ]]; then
-            "$TITLE_GEN" "$SID" >/dev/null 2>&1
-          else
-            ( "$TITLE_GEN" "$SID" >/dev/null 2>&1 & disown ) 2>/dev/null
-          fi
+          ( "$TITLE_GEN" "$SID" >/dev/null 2>&1 & disown ) 2>/dev/null
         fi
       fi
     fi
@@ -745,15 +736,13 @@ case "$ROLE" in
     # archive_pending=true and exited without archiving. Now that the
     # turn has completed and the hourglass has cleared, finish the job.
     #
-    # Also covers headless_origin: sessions spawned from DM `new <path>:
-    # <prompt>` run as `claude -p` headless, which never fires SessionEnd.
-    # Daemon sets headless_origin=true after the channel appears; the
-    # first assistant Stop archives the channel here.
+    # Note: headless_origin sessions (DM `new …` spawns) intentionally
+    # do NOT auto-archive here — the channel stays open so the user can
+    # read the reply and follow up via channel-reply routing. User
+    # archives manually with `exit` in the channel.
     ARCHIVE_PENDING="$(jq -r '.archive_pending // false' "$STATE_FILE" 2>/dev/null)"
-    HEADLESS_ORIGIN="$(jq -r '.headless_origin // false' "$STATE_FILE" 2>/dev/null)"
     SLACK_ARCHIVED="$(jq -r '.slack_archived // false' "$STATE_FILE" 2>/dev/null)"
-    if { [[ "$ARCHIVE_PENDING" = "true" ]] || [[ "$HEADLESS_ORIGIN" = "true" ]]; } \
-       && [[ "$SLACK_ARCHIVED" != "true" ]]; then
+    if [[ "$ARCHIVE_PENDING" = "true" ]] && [[ "$SLACK_ARCHIVED" != "true" ]]; then
       post_to_channel "$CHANNEL_ID" "_session ended · archived_" \
         "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
       archive_channel "$CHANNEL_ID"
@@ -787,13 +776,20 @@ case "$ROLE" in
       exit 0
     fi
 
-    # Already-archived guard. Headless DM-spawned sessions get archived
-    # by the assistant Stop handler (headless_origin path); a late
-    # SessionEnd would otherwise post a second tombstone, which fails
-    # with is_archived and triggers mirror.sh's self-heal unarchive,
-    # leaving the channel un-archived. Skip cleanly.
+    # Already-archived guard.
     if [[ "$(jq -r '.slack_archived // false' "$STATE_FILE" 2>/dev/null)" = "true" ]]; then
       log "skip end (already slack_archived) sid=$SID8"
+      exit 0
+    fi
+
+    # Headless DM-spawned sessions stay open after the first turn so the
+    # user can read the reply on their phone and follow up via channel-
+    # reply routing. The user explicitly archives by typing `exit` in
+    # the channel (daemon's in-channel exit handler). Don't auto-archive
+    # on the synthetic SessionEnd that `claude -p` fires when the
+    # subprocess exits.
+    if [[ "$(jq -r '.headless_origin // false' "$STATE_FILE" 2>/dev/null)" = "true" ]]; then
+      log "skip end (headless_origin — channel persists) sid=$SID8"
       exit 0
     fi
 

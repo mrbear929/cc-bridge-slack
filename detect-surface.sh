@@ -77,6 +77,21 @@ case "${__CFBundleIdentifier:-}" in
 esac
 
 # Match in priority order
+
+# cc-bridge daemon spawned this `claude -p`? Detect by looking for the
+# daemon's main.py in any ancestor command line. Walk parents again with
+# full argv (`-c command` rather than just comm name).
+PID=$PPID
+for _ in $(seq 1 20); do
+  ARGS="$(ps -p "$PID" -o args= 2>/dev/null)"
+  if [[ "$ARGS" == *"cc-bridge-daemon"* ]] || [[ "$ARGS" == *"cc-bridge-slack/daemon/main.py"* ]]; then
+    echo "slack-dm"; exit 0
+  fi
+  NEXT="$(ps -p "$PID" -o ppid= 2>/dev/null | tr -d ' ')"
+  [[ -z "$NEXT" || "$NEXT" = "0" || "$NEXT" = "1" ]] && break
+  PID="$NEXT"
+done
+
 if ancestor_has 'obsidian'; then
   if [[ "$ENTRYPOINT" = "sdk-ts" ]]; then
     echo "obsidian-claudian"

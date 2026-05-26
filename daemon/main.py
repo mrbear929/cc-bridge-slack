@@ -871,11 +871,17 @@ def handle_new_session(text: str) -> str:
             ch = d.get("channel_id")
             if not ch:
                 continue
-            # Mark headless-origin so mirror.sh archives the channel after
-            # the first assistant Stop (claude -p doesn't fire SessionEnd).
+            # Tag headless_origin and stamp surface=slack-dm so the channel
+            # init message + downstream tooling can tell at a glance these
+            # sessions came from a phone DM. Channel does NOT auto-archive
+            # at the end of the first turn — user can keep replying in the
+            # channel (channel-reply routing reuses the sid via
+            # `claude -p --resume`) and explicitly archives with `exit`.
             sid_found = d.get("session_id", "")
             if sid_found:
-                state_update(sid_found, lambda s: {**s, "headless_origin": True})
+                state_update(sid_found, lambda s: {**s,
+                                                    "headless_origin": True,
+                                                    "surface": "slack-dm"})
             return f"<#{ch}> ready (sid `{sid_found[:8]}`)"
         time.sleep(1)
 
