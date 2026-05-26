@@ -473,7 +473,8 @@ def on_message(event: dict[str, Any], client, say) -> None:
             "• `active` — list running sessions\n"
             "• `recent` — list recently-archived sessions\n"
             "• `sweep` — archive any state-archived sessions whose Slack channel is still open\n"
-            "• `new <path>: <prompt>` — start a fresh CC session headlessly\n"
+            "• `new <prompt>` — start a fresh CC session in the vault (default path)\n"
+            "• `new <path>: <prompt>` — start a fresh CC session in a specific cwd\n"
             "_To reply to a session, message in its channel directly._"
         )
         return
@@ -743,14 +744,19 @@ def sweep_once(grace_days: int = 0) -> tuple[int, int]:
     return archived_count, error_count
 
 
-_NEW_USAGE = "usage: `new <path>: <prompt>`"
+_NEW_USAGE = "usage: `new <prompt>` or `new <path>: <prompt>`"
+_DEFAULT_NEW_CWD = os.path.expanduser("~/Documents/obsidian-vault")
 
 
 def handle_new_session(text: str) -> str:
-    """Parse a `new <path>: <prompt>` (or `new <path>\\n<prompt>`) DM,
-    spawn a detached `claude -p` headless subprocess, watch the state
-    dir for the new sid, and return a Slack-formatted response with
-    the channel link. Returns the string the DM handler should `say`.
+    """Parse a `new [<path>:] <prompt>` DM, spawn a detached `claude -p`
+    headless subprocess, watch the state dir for the new sid, return a
+    Slack-formatted response with the channel link.
+
+    Forms accepted:
+      new <prompt>                          → cwd defaults to vault
+      new <path>: <prompt>                  → explicit cwd (single line)
+      new <path>\\n<prompt>                  → explicit cwd (two lines)
 
     Returns synchronously after at most ~30s (success) or 1s (parse
     error). Subprocess runs detached — daemon does not wait for CC.
@@ -765,7 +771,10 @@ def handle_new_session(text: str) -> str:
     if not body:
         return _NEW_USAGE
 
-    # Parse two forms: "<path>: <prompt>" OR "<path>\n<prompt>"
+    # Parse three forms:
+    #   "<path>\n<prompt>"  → multi-line, explicit path
+    #   "<path>: <prompt>"  → explicit path
+    #   "<prompt>"          → default path (~/Documents/obsidian-vault)
     path = ""
     prompt = ""
     if "\n" in body:
@@ -773,13 +782,23 @@ def handle_new_session(text: str) -> str:
         path = path_part.strip().rstrip(":").strip()
         prompt = prompt_part.strip()
     elif ":" in body:
-        path_part, _, prompt_part = body.partition(":")
-        path = path_part.strip()
-        prompt = prompt_part.strip()
+        # Heuristic: only treat the part before `:` as a path if it looks
+        # like one (starts with `/`, `~`, or `.`). Otherwise the whole
+        # body is a prompt that happens to contain a colon (e.g.
+        # "new summarize this: blah blah").
+        before, _, after = body.partition(":")
+        before_s = before.strip()
+        if before_s.startswith(("/", "~", ".")):
+            path = before_s
+            prompt = after.strip()
+        else:
+            path = _DEFAULT_NEW_CWD
+            prompt = body.strip()
     else:
-        return _NEW_USAGE
+        path = _DEFAULT_NEW_CWD
+        prompt = body.strip()
 
-    if not path or not prompt:
+    if not prompt:
         return _NEW_USAGE
 
     # Expand ~ and env vars; resolve symlinks (e.g. /tmp → /private/tmp on
