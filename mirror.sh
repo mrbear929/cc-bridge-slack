@@ -712,7 +712,16 @@ case "$ROLE" in
       if [[ "$RENAMED" != "true" ]]; then
         TITLE_GEN="$(dirname "$0")/title-generator.sh"
         if [[ -x "$TITLE_GEN" ]]; then
-          ( "$TITLE_GEN" "$SID" >/dev/null 2>&1 & disown ) 2>/dev/null
+          # Headless-origin sessions (DM `new …`) get archived a few lines
+          # below in this same Stop handler. Run title-gen synchronously
+          # so the rename completes before archive — Slack rejects rename
+          # on an archived channel.
+          HEADLESS="$(jq -r '.headless_origin // false' "$STATE_FILE" 2>/dev/null)"
+          if [[ "$HEADLESS" = "true" ]]; then
+            "$TITLE_GEN" "$SID" >/dev/null 2>&1
+          else
+            ( "$TITLE_GEN" "$SID" >/dev/null 2>&1 & disown ) 2>/dev/null
+          fi
         fi
       fi
     fi
@@ -735,14 +744,23 @@ case "$ROLE" in
     # prompt was hanging (pending_user_ts was set), the end case marked
     # archive_pending=true and exited without archiving. Now that the
     # turn has completed and the hourglass has cleared, finish the job.
+    #
+    # Also covers headless_origin: sessions spawned from DM `new <path>:
+    # <prompt>` run as `claude -p` headless, which never fires SessionEnd.
+    # Daemon sets headless_origin=true after the channel appears; the
+    # first assistant Stop archives the channel here.
     ARCHIVE_PENDING="$(jq -r '.archive_pending // false' "$STATE_FILE" 2>/dev/null)"
-    if [[ "$ARCHIVE_PENDING" = "true" ]]; then
+    HEADLESS_ORIGIN="$(jq -r '.headless_origin // false' "$STATE_FILE" 2>/dev/null)"
+    SLACK_ARCHIVED="$(jq -r '.slack_archived // false' "$STATE_FILE" 2>/dev/null)"
+    if { [[ "$ARCHIVE_PENDING" = "true" ]] || [[ "$HEADLESS_ORIGIN" = "true" ]]; } \
+       && [[ "$SLACK_ARCHIVED" != "true" ]]; then
       post_to_channel "$CHANNEL_ID" "_session ended · archived_" \
         "$CLAUDE_DISPLAY_NAME" "$CLAUDE_ICON_URL" >/dev/null
       archive_channel "$CHANNEL_ID"
-      safe_state_update "$SID" \
-        '. + {slack_archived: true} | del(.archive_pending)'
-      log "deferred archive completed sid=$SID8"
+      safe_state_update "$SID" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '. + {archived: true, archived_at: $ts, archived_by: "post-stop",
+              slack_archived: true} | del(.archive_pending)'
+      log "stop-driven archive completed sid=$SID8"
     fi
 
     # Mark session idle so daemon can drain any queued Slack messages.

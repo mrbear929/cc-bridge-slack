@@ -458,9 +458,11 @@ def on_message(event: dict[str, Any], client, say) -> None:
 
         # `new <path>: <prompt>` — mobile-initiated session.
         # Match on the original `text` (case-preserved) so paths and prompts
-        # aren't lower-cased.
-        if text.lower().startswith("new"):
-            response = handle_new_session(text)
+        # aren't lower-cased. Strip backticks first — Slack auto-formats
+        # copy-paste from code spans with surrounding `…`.
+        text_stripped = text.strip().strip("`").strip()
+        if text_stripped.lower().startswith("new"):
+            response = handle_new_session(text_stripped)
             say(response)
             return
 
@@ -753,7 +755,9 @@ def handle_new_session(text: str) -> str:
     Returns synchronously after at most ~30s (success) or 1s (parse
     error). Subprocess runs detached — daemon does not wait for CC.
     """
-    body = text.strip()
+    # Slack mobile/desktop sometimes wraps the message in backticks when
+    # the user copy-pastes from a code-formatted help line. Strip them.
+    body = text.strip().strip("`").strip()
     # Strip leading "new" keyword
     if not body.lower().startswith("new"):
         return _NEW_USAGE
@@ -831,7 +835,12 @@ def handle_new_session(text: str) -> str:
             ch = d.get("channel_id")
             if not ch:
                 continue
-            return f"<#{ch}> ready (sid `{d.get('session_id','')[:8]}`)"
+            # Mark headless-origin so mirror.sh archives the channel after
+            # the first assistant Stop (claude -p doesn't fire SessionEnd).
+            sid_found = d.get("session_id", "")
+            if sid_found:
+                state_update(sid_found, lambda s: {**s, "headless_origin": True})
+            return f"<#{ch}> ready (sid `{sid_found[:8]}`)"
         time.sleep(1)
 
     return ("spawned, but channel didn't appear within 30s. "

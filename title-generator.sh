@@ -70,6 +70,19 @@ if [[ -z "$TITLE_FULL" && -f "$TRANSCRIPT" ]]; then
   fi
 fi
 
+# === Source 3: headless_origin fallback (DM `new <path>: <prompt>` spawns) ===
+# `claude -p` does not generate ai-title. Without this fallback, headless-spawned
+# channels keep the placeholder name forever. Use the first prompt as a slug.
+HEADLESS_ORIGIN="$(jq -r '.headless_origin // false' "$STATE_FILE" 2>/dev/null)"
+if [[ -z "$TITLE_FULL" && "$HEADLESS_ORIGIN" = "true" ]]; then
+  FIRST_PROMPT="$(jq -r '.first_prompt // empty' "$STATE_FILE" 2>/dev/null)"
+  if [[ -n "$FIRST_PROMPT" ]]; then
+    # Truncate to first 60 chars; sentence-case-ish so it reads OK as a name
+    TITLE_FULL="$(printf '%s' "$FIRST_PROMPT" | head -c 60)"
+    log "using first_prompt as headless title: $TITLE_FULL"
+  fi
+fi
+
 # Title not generated yet by either source. Exit quietly — next Stop
 # will retry.
 if [[ -z "$TITLE_FULL" ]]; then
