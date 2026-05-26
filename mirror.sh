@@ -787,6 +787,16 @@ case "$ROLE" in
       exit 0
     fi
 
+    # Already-archived guard. Headless DM-spawned sessions get archived
+    # by the assistant Stop handler (headless_origin path); a late
+    # SessionEnd would otherwise post a second tombstone, which fails
+    # with is_archived and triggers mirror.sh's self-heal unarchive,
+    # leaving the channel un-archived. Skip cleanly.
+    if [[ "$(jq -r '.slack_archived // false' "$STATE_FILE" 2>/dev/null)" = "true" ]]; then
+      log "skip end (already slack_archived) sid=$SID8"
+      exit 0
+    fi
+
     # Archive immediately on SessionEnd, guarded by pending_user_ts. If a
     # user prompt is still hanging (⏳ on it, no Stop yet), defer archive:
     # mark archive_pending=true and exit. The next assistant Stop will

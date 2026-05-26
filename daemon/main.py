@@ -691,14 +691,19 @@ def _humanize_age(iso: str) -> str:
 
 
 def sweep_once(grace_days: int = 0) -> tuple[int, int]:
-    """One-shot sweep: walk state files, find sessions where archived_at
-    is older than `grace_days`, archive the Slack channel, set
-    `slack_archived=true`. Returns `(archived_count, error_count)`.
+    """One-shot sweep: walk state files, find sessions whose state says
+    archived but whose Slack channel is still open, archive the channel,
+    set `slack_archived=true`. Returns `(archived_count, error_count)`.
 
-    Primary archive mechanism is now mirror.sh SessionEnd (Task 2).
-    This is the manual fallback the user invokes via DM `sweep`.
-    grace_days=0 by default: archive everything currently in the
-    state-archived-but-not-slack-archived state."""
+    Considers two cases:
+      1. state.archived=true AND state.slack_archived=false (never archived)
+      2. state.archived=true AND state.slack_archived=true BUT Slack-side
+         is_archived=false (drift — channel was unarchived out-of-band, e.g.
+         by mirror.sh's is_archived self-heal firing on a late stray post)
+
+    Primary archive mechanism is mirror.sh SessionEnd (Task 2). This is
+    the manual fallback the user invokes via DM `sweep`. grace_days=0
+    by default."""
     archived_count = 0
     error_count = 0
     try:
@@ -708,7 +713,7 @@ def sweep_once(grace_days: int = 0) -> tuple[int, int]:
                 d = json.loads(f.read_text())
             except json.JSONDecodeError:
                 continue
-            if not d.get("archived") or d.get("slack_archived"):
+            if not d.get("archived"):
                 continue
             iso = d.get("archived_at", "")
             if not iso:
@@ -722,6 +727,18 @@ def sweep_once(grace_days: int = 0) -> tuple[int, int]:
             ch = d.get("channel_id")
             if not ch:
                 continue
+
+            # If state already says slack_archived, verify the channel is
+            # actually archived in Slack. If not (drift), re-archive.
+            if d.get("slack_archived"):
+                try:
+                    info = app.client.conversations_info(channel=ch)
+                    if info.get("channel", {}).get("is_archived"):
+                        continue  # state is consistent, nothing to do
+                except Exception as e:
+                    log.warning("sweep info-check failed channel=%s: %s", ch, e)
+                    continue
+
             try:
                 app.client.conversations_archive(channel=ch)
                 log.info("swept (archived) sid=%s channel=%s age=%dd",
