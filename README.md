@@ -7,6 +7,5 @@ back into the running session.
 ## Docs
 
 - [Product requirements (PRD)](docs/PRD.md) — features, status, acceptance tests, usage reference
-- [Architecture & design](docs/README.md)
-- [Installation guide](docs/INSTALL.md)
-- [Development log](docs/DEVLOG.md) — current architecture, invariants, known sharp edges
+- [Installation guide](docs/INSTALL.md) — fresh-Mac bootstrap, Slack app scopes, troubleshooting
+- [Development log](docs/DEVLOG.md) — architecture, invariants, known sharp edges, lessons
